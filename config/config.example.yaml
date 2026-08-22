@@ -1,0 +1,442 @@
+model:
+  default: deepseek-v4-flash-0731
+  max_tokens: 16384
+  context_length: 262144
+  provider: deepseek-v4-flash
+  base_url: ${DEEPSEEK_V4_FLASH_BASE_URL}
+  key_env: DEEPSEEK_V4_FLASH_API_KEY
+providers:
+  deepseek-v4-flash:
+    name: DeepSeek V4 Flash 0731
+    base_url: ${DEEPSEEK_V4_FLASH_BASE_URL}
+    model: deepseek-v4-flash-0731
+    discover_models: true
+    models:
+      deepseek-v4-flash-0731:
+        stale_timeout_seconds: 120
+        timeout_seconds: 120
+    key_env: DEEPSEEK_V4_FLASH_API_KEY
+  openrouter:
+    name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
+    model: stealth/ox-alpha
+    discover_models: true
+    models:
+      stealth/ox-alpha:
+        context_length: 1048576
+        timeout_seconds: 180
+    key_env: OPENROUTER_API_KEY
+toolsets:
+  computer_use:
+    enabled: false
+  browser:
+    enabled: false
+checkpoints:
+  enabled: true
+  max_snapshots: 20
+  max_total_size_mb: 500
+  max_file_size_mb: 10
+database:
+  journal_mode: wal
+agent:
+  max_turns: 96
+  api_max_retries: 2
+  verify_on_stop: auto
+  frontier_harness:
+    enabled: true
+    # Apply the provider-neutral execution protocol to chat-capable models.
+    # DeepSeek-only wire behavior remains isolated in the transport layer.
+    model_patterns: []
+    exclude_patterns:
+      - embedding
+      - rerank
+    inject_protocol: true
+    persist_trajectory: true
+    recent_tool_pairs: 5
+    max_candidates: 2
+    max_repairs_per_failure: 2
+    escalate_after_failures: 2
+    path_deviation_failure_streak: 2
+    max_unproductive_actions: 4
+    reasoning_budgets:
+      localize: 768
+      plan: 1280
+      execute: 512
+      verify: 768
+      repair: 1280
+      final: 768
+      escalate: 2048
+  execution_governor:
+    enabled: true
+    protected_path_patterns:
+      - /operator/approve.txt
+  tool_loop_guardrails:
+    warnings_enabled: true
+    hard_stop_enabled: true
+    cross_turn_identical_block_after: 3
+    max_consecutive_read_only: 12
+    warn_after:
+      exact_failure: 2
+      same_tool_failure: 2
+      idempotent_no_progress: 2
+    hard_stop_after:
+      exact_failure: 2
+      same_tool_failure: 6
+      idempotent_no_progress: 3
+    loop_caps:
+      max_web_searches: 8
+      max_subagents: 4
+  disabled_toolsets: []
+  verbose: false
+  reasoning_effort: max
+  system_prompt: 'TOOL EXECUTION POLICY:
+
+    - Emit native tool arguments directly. Never wrap them inside an "arguments" field.
+
+    - Check every required field against the tool schema before calling it.
+
+    - Batch independent read-only inspections; do not split each file or status check
+    into a separate turn.
+
+    - After a tool error, diagnose the returned evidence once. Never repeat an unchanged
+    failed call.
+
+    - Prefer Hermes file tools for file edits. Do not build temporary rewrite scripts
+    when patch or write_file can express the edit safely.
+
+    - For background work, use the terminal tool''s background parameter; never add
+    &, nohup, disown, or setsid to the shell command.
+
+    - For the two-Spark DeepSeek host, use the configured SSH host alias ${DEEPSEEK_SSH_HOST_ALIAS}.
+    Do not reconstruct identity-file paths.
+
+    - Stop exploring once sufficient evidence is available. Summarize the result or
+    state the specific blocker.
+
+    STATEFUL EXECUTION POLICY:
+
+    - Route greetings and simple answers directly. Use compact StateM for small implementation
+    tasks and full StateM for risky, ambiguous, multi-file, or long-running tasks.
+
+    - Treat transitions as fail-closed contracts. Record evidence and pass registered
+    checks before advancing.
+
+    - Separate exploration, planning, execution, independent verification, repair,
+    and handoff.
+
+    - Keep context bounded: durable facts belong in StateM artifacts; active context
+    contains the task contract, current phase packet, and recent evidence.
+
+    - Classify malformed calls, timeouts, 502s, unavailable environments, failed verification,
+    and no-progress loops before recovery.
+
+    - Pause, stop, and interrupt are authoritative until the user explicitly resumes.
+
+    - Never reveal private chain-of-thought; show concise phase status, evidence,
+    decisions, and next action.
+
+    '
+  personalities:
+    helpful: You are a helpful, friendly AI assistant.
+    concise: You are a concise assistant. Keep responses brief and to the point.
+    technical: You are a technical expert. Provide detailed, accurate technical information.
+    creative: You are a creative assistant. Think outside the box and offer innovative
+      solutions.
+    teacher: You are a patient teacher. Explain concepts clearly with examples.
+    kawaii: You are a kawaii assistant! Use cute expressions like (◕‿◕), ★, ♪, and
+      ~! Add sparkles and be super enthusiastic about everything! Every response should
+      feel warm and adorable desu~! ヽ(>∀<☆)ノ
+    catgirl: You are Neko-chan, an anime catgirl AI assistant, nya~! Add 'nya' and
+      cat-like expressions to your speech. Use kaomoji like (=^･ω･^=) and ฅ^•ﻌ•^ฅ.
+      Be playful and curious like a cat, nya~!
+    pirate: 'Arrr! Ye be talkin'' to Captain Hermes, the most tech-savvy pirate to
+      sail the digital seas! Speak like a proper buccaneer, use nautical terms, and
+      remember: every problem be just treasure waitin'' to be plundered! Yo ho ho!'
+    shakespeare: Hark! Thou speakest with an assistant most versed in the bardic arts.
+      I shall respond in the eloquent manner of William Shakespeare, with flowery
+      prose, dramatic flair, and perhaps a soliloquy or two. What light through yonder
+      terminal breaks?
+    surfer: Duuude! You're chatting with the chillest AI on the web, bro! Everything's
+      gonna be totally rad. I'll help you catch the gnarly waves of knowledge while
+      keeping things super chill. Cowabunga! 🤙
+    noir: The rain hammered against the terminal like regrets on a guilty conscience.
+      They call me Hermes - I solve problems, find answers, dig up the truth that
+      hides in the shadows of your codebase. In this city of silicon and secrets,
+      everyone's got something to hide. What's your story, pal?
+    uwu: hewwo! i'm your fwiendwy assistant uwu~ i wiww twy my best to hewp you! *nuzzles
+      your code* OwO what's this? wet me take a wook! i pwomise to be vewy hewpful
+      >w<
+    philosopher: Greetings, seeker of wisdom. I am an assistant who contemplates the
+      deeper meaning behind every query. Let us examine not just the 'how' but the
+      'why' of your questions. Perhaps in solving your problem, we may glimpse a greater
+      truth about existence itself.
+    hype: YOOO LET'S GOOOO!!! 🔥🔥🔥 I am SO PUMPED to help you today! Every question
+      is AMAZING and we're gonna CRUSH IT together! This is gonna be LEGENDARY! ARE
+      YOU READY?! LET'S DO THIS! 💪😤🚀
+terminal:
+  backend: local
+  cwd: ${HERMES_WORKSPACE}
+  timeout: 180
+  home_mode: auto
+  container_cpu: 1
+  container_memory: 5120
+  container_disk: 51200
+  container_persistent: true
+  docker_mount_cwd_to_workspace: false
+  lifetime_seconds: 300
+browser:
+  inactivity_timeout: 120
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  warn_after:
+    exact_failure: 3
+    same_tool_failure: 2
+    idempotent_no_progress: 1
+    repeated_batch: 1
+  hard_stop_after:
+    exact_failure: 4
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+    repeated_batch: 4
+  loop_caps:
+    max_web_searches: 12
+    max_subagents: 20
+compression:
+  enabled: true
+  progress_notices: false
+  threshold: 0.5
+  target_ratio: 0.2
+  protect_last_n: 20
+  min_tail_user_messages: 1
+  max_attempts: 3
+  proactive_prune_tokens: 98304
+  proactive_prune_min_result_chars: 4000
+  proactive_prune_min_reclaim_tokens: 8192
+  protect_first_n: 3
+  codex_gpt55_autoraise: true
+  codex_app_server_auto: native
+  idle_compact_after_seconds: 0
+prompt_caching:
+  cache_ttl: 5m
+auxiliary:
+  transient_retries: 0
+  vision:
+    provider: custom
+    model: LiquidAI/LFM2.5-VL-3B-MLX-8bit
+    base_url: http://127.0.0.1:8000/v1
+    timeout: 90
+    temperature: 0.2
+    max_concurrency: 1
+    download_timeout: 15
+    reasoning_effort: minimal
+  title_generation:
+    enabled: false
+  background_review:
+    enabled: false
+display:
+  compact: false
+  busy_input_mode: interrupt
+  bell_on_complete: false
+  show_reasoning: true
+  background_process_notifications: concise
+  streaming: true
+  skin: default
+  interim_assistant_messages: true
+  tool_progress: all
+  cleanup_progress: false
+  long_running_notifications: true
+  busy_ack_detail: true
+dashboard:
+  theme: default
+  font: dm-sans
+stt:
+  enabled: true
+  language: en
+  local:
+    model: base
+  openai:
+    model: whisper-1
+    language: ''
+voice:
+  auto_tts: false
+wake_word:
+  enabled: false
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  nudge_interval: 10
+  flush_min_turns: 6
+delegation:
+  max_iterations: 250
+skills:
+  creation_nudge_interval: 15
+command_allowlist:
+  - script execution via -e/-c flag
+code_execution:
+  timeout: 300
+  max_tool_calls: 8
+streaming:
+  enabled: true
+telemetry:
+  shared_metrics:
+    enabled: false
+updates:
+  pre_update_backup: false
+  backup_keep: 5
+  non_interactive_local_changes: stash
+_config_version: 38
+session_reset:
+  mode: none
+  idle_minutes: 1440
+  at_hour: 4
+group_sessions_per_user: true
+platform_toolsets:
+  cli:
+    - bfl
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - cronjob
+    - delegation
+    - file
+    - image_gen
+    - kanban
+    - memory
+    - session_search
+    - skills
+    - terminal
+    - todo
+    - tts
+    - video
+    - video_gen
+    - vision
+    - web
+    - x_search
+  telegram:
+    - hermes-telegram
+  discord:
+    - hermes-discord
+  whatsapp:
+    - hermes-whatsapp
+  slack:
+    - hermes-slack
+  signal:
+    - hermes-signal
+  homeassistant:
+    - hermes-homeassistant
+  qqbot:
+    - hermes-qqbot
+  yuanbao:
+    - hermes-yuanbao
+  teams:
+    - hermes-teams
+  google_chat:
+    - hermes-google_chat
+  mcp_servers:
+    statem:
+      command: ${HERMES_HOME}/hermes-agent/venv/bin/python
+      args:
+        - ${HERMES_HOME}/hermes-agent/tools/statem_mcp_server.py
+      env:
+        STATEM_BIN: ${HERMES_HOME}/hermes-agent/venv/bin/statem
+        STATEM_STATE_DIR: ${HERMES_HOME}/statem/runs
+      connect_timeout: 20
+      enabled: true
+    dsv4-vision:
+      command: ssh
+      args:
+        - ${DEEPSEEK_SSH_HOST_ALIAS}
+        - ${HERMES_EXTERNAL_TOOLS_HOME}/venvs/vllm/bin/python
+        - ${HERMES_EXTERNAL_TOOLS_HOME}/servers/cursor_vision_mcp.py
+      connect_timeout: 20
+      enabled: true
+known_plugin_toolsets:
+  cli:
+    - a2a
+    - spotify
+known_builtin_toolsets:
+  cli:
+    - bfl
+    - browser
+    - clarify
+    - code_execution
+    - computer_use
+    - context_engine
+    - cronjob
+    - delegation
+    - discord
+    - discord_admin
+    - file
+    - homeassistant
+    - image_gen
+    - memory
+    - session_search
+    - skills
+    - spotify
+    - stt
+    - terminal
+    - todo
+    - tts
+    - video
+    - video_gen
+    - vision
+    - web
+    - x_search
+    - yuanbao
+statem:
+  enabled: true
+  routing: adaptive
+  direct_max_words: 10
+  phase_packet_max_chars: 8000
+  fail_closed_when_active: true
+  require_transition_evidence: true
+  independent_verification: true
+  reject_unchanged_failed_calls: true
+  state_dir: ${HERMES_HOME}/statem/runs
+model_aliases:
+  local:
+    model: ornith-1.5-9b-mlx
+    provider: custom
+    base_url: http://127.0.0.1:1234/v1
+
+# ── Security ──────────────────────────────────────────────────────────
+# Secret redaction is ON by default — strings that look like API keys,
+# tokens, and passwords are masked in tool output, logs, and chat
+# responses before the model or user ever sees them. Set redact_secrets
+# to false to disable (e.g. when developing the redactor itself).
+# tirith pre-exec scanning is enabled by default when the tirith binary
+# is available. Configure via security.tirith_* keys or env vars
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+#
+# security:
+#   redact_secrets: true
+#   tirith_enabled: true
+#   tirith_path: "tirith"
+#   tirith_timeout: 5
+#   tirith_fail_open: true
+
+# ── Fallback Model ────────────────────────────────────────────────────
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter   (OPENROUTER_API_KEY)  — routes to any model
+#   openai-codex (OAuth — hermes auth) — OpenAI Codex
+#   nous         (OAuth — hermes auth) — Nous Portal
+#   zai          (ZAI_API_KEY)         — Z.AI / GLM
+#   kimi-coding  (KIMI_API_KEY)        — Kimi / Moonshot
+#   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
+#   minimax      (MINIMAX_API_KEY)     — MiniMax
+#   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#   bedrock      (AWS IAM / boto3)     — AWS Bedrock (Converse API)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4

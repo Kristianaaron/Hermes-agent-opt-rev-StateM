@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env*
+!.env.example
+config/config.yaml
+config/*.local.yaml
+**/auth.json
+**/*credentials*
+**/*secret*
+**/*token*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Hermes runtime state
+**/state.json
+**/*.lock
+**/logs/
+**/cache/
+**/checkpoints/
+**/sessions/
+**/*history*
+**/*provenance*
+**/.curator_*
+**/.hub/
+
+# Local model and environment artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.cache/
+.DS_Store
