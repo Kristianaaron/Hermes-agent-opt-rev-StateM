@@ -1,8 +1,8 @@
-# Hermes Agent Optimization: DeepSeek V4 Flash + StateM
+# Hermes Agent Optimization: Frontier + StateM harness
 
-An update-safe execution harness for Hermes Agent, tuned for DeepSeek V4 Flash 0731 while remaining useful across local and hosted OpenAI-compatible models.
+An update-safe execution harness for Hermes Agent. It is tuned for DeepSeek V4 Flash while remaining useful across local and hosted OpenAI-compatible models, including GLM 5.3 Flash on Spark-style chat templates.
 
-This project does not replace Hermes Agent or fork its full source tree. It layers a portable configuration, a fail-closed source overlay, StateM lifecycle support, provider-aware request handling, tool-call hardening, and an optional local vision adapter over a compatible Hermes installation.
+This project does not replace Hermes Agent or fork its full source tree. It layers a portable configuration, a fail-closed source overlay, StateM lifecycle support, provider-aware request handling, tool-call hardening, Codex-style GLM effort routing, and an optional local vision adapter over a compatible Hermes installation.
 
 The objective is practical agent performance: fewer malformed tool calls, fewer repeated actions, safer recovery after timeouts, better continuity across long tasks, and stronger evidence that the requested work was actually completed.
 
@@ -15,7 +15,7 @@ The objective is practical agent performance: fewer malformed tool calls, fewer 
 | Tool failures | Provider and model dependent | Argument normalization, ID repair, bounded recovery, repeated-call protection |
 | Timeouts | Retry or provider error handling | Verify-before-retry semantics for potentially completed mutations |
 | Model support | Broad provider support | Broad support plus capability-safe Frontier policy and DSV4-specific tuning |
-| Reasoning | Provider/model configuration | DSV4 max reasoning with provider vocabulary clamping for other models |
+| Reasoning | Provider/model configuration | DSV4 max reasoning; GLM keeps thinking on and switches Spark-legal `low`/`high` per request; other models clamp to their wire vocabulary |
 | Observability | Normal logs and status | Bounded phase transitions for provider wait, tools, compaction, interruption, and completion |
 | Updates | Local modifications can drift or be overwritten | Digest-verified overlay that reapplies only when clean and otherwise fails closed |
 | Vision | Provider or computer-use dependent | Optional local LFM2.5-VL auxiliary vision endpoint |
@@ -23,7 +23,7 @@ The objective is practical agent performance: fewer malformed tool calls, fewer 
 ## Architecture
 
 ```text
-DeepSeek V4 Flash 0731 or another chat model
+DeepSeek V4 Flash, GLM 5.3 Flash, or another chat model
                     |
                     v
         Provider-aware transport layer
@@ -32,11 +32,14 @@ DeepSeek V4 Flash 0731 or another chat model
       Frontier + StateM execution harness
                     |
                     v
+      GLM Codex-style effort plugin (GLM only)
+                    |
+                    v
       Native Hermes tools, skills, memory,
        checkpoints, verification, and UI
 ```
 
-DeepSeek-specific behavior stays in the transport and model configuration layers. The execution protocol and safety controls remain provider-neutral, so OpenRouter models, hosted APIs, local vLLM servers, LM Studio, Ollama, and other OpenAI-compatible endpoints can benefit without receiving unsupported DeepSeek fields.
+DeepSeek-specific behavior stays in the transport and model configuration layers. GLM-specific `low`/`high` thinking stays in `plugins/glm-codex-effort`. The execution protocol and safety controls remain provider-neutral, so OpenRouter models, hosted APIs, local vLLM servers, LM Studio, Ollama, and other OpenAI-compatible endpoints can benefit without receiving unsupported DeepSeek or GLM fields.
 
 Embedding and reranking endpoints are excluded from the agent protocol by default.
 
@@ -124,6 +127,23 @@ The primary profile retains the behavior required by the custom DSV4 endpoint:
 - No changes to the separate DeepSeek/vLLM serving recipe
 
 The harness improves execution quality and reliability. It does not modify model weights or claim to transform DSV4 into a different underlying model.
+
+### GLM 5.3 Flash Codex-style effort
+
+Spark's GLM chat template only honors `low` and `high`. Any other `reasoning_effort` value becomes max, which is why GLM overthinks when Hermes pins `high` globally.
+
+`plugins/glm-codex-effort` is a Hermes `llm_request` middleware inspired by Codex, Cursor, and Grok UX:
+
+- Thinking stays **on**. It is never disabled.
+- `reasoning_effort` is rewritten to Spark-legal **`low` or `high` per request**.
+- **High** for plan, repair, escalate, or a clearly hard first turn.
+- **Low** for simple local edits and routine tool hops.
+- Invalid effort is clamped to **low**, never max.
+- `clear_thinking: true` so prior CoT is not re-deliberated on every tool hop.
+
+This is a Hermes-side approximation. GLM still thinks on every request; it cannot internally skip think inside `high` the way Grok can without training.
+
+Copy the plugin to `~/.hermes/plugins/glm-codex-effort` and enable it in `plugins.enabled`. Older Hermes builds that lack `register_system_prompt_section` still apply the wire rewrite; they just skip the extra prompt section.
 
 ### Cross-model capability safety
 
@@ -217,13 +237,18 @@ Perplexity, execution success, and throughput are deliberately reported separate
 ## Repository contents
 
 - `config/config.example.yaml`: redacted multi-provider Hermes configuration template
-- `customizations/frontier-harness/overlay.patch`: Frontier, StateM, tool, and lifecycle source overlay
+- `customizations/frontier-harness/overlay.patch`: Frontier, StateM, tool, commentary-gate, and lifecycle source overlay for Hermes **0.21.1**
 - `customizations/frontier-harness/reapply.py`: fail-closed update reapplication controller
+- `customizations/frontier-harness/verify_overlay.py`: offline overlay marker and import verification
+- `customizations/frontier-harness/gateway_start.py`: launchd entrypoint that refuses to start if the compatibility gate fails
 - `customizations/frontier-harness/manifest.json`: capability, provenance, and integrity manifest
+- `plugins/glm-codex-effort`: Codex-style GLM `low`/`high` thinking plugin and offline tests
 - `bin/hermes-statem`: portable StateM launcher
 - `bin/lfm25_vl_server.py`: local OpenAI-compatible LFM vision adapter
 - `bin/start-lfm25-vl3b-local.sh`: local MLX vision service launcher
 - `.env.example`: empty environment-variable placeholders
+
+Live machine paths, Spark hostnames, OMP recovery git bundles, `config.snapshot.yaml`, session data, and API keys stay local. The GitHub copy is sanitized.
 
 ## Security and portability
 
@@ -247,8 +272,9 @@ All credentials and private endpoint values must be supplied locally through env
 2. Copy `.env.example` to an untracked `.env` and provide local values.
 3. Adapt `config/config.example.yaml` without committing private endpoint information.
 4. Place the customization bundle under the local Hermes customization directory.
-5. Apply the overlay only when its clean-check succeeds.
-6. Install StateM and the optional LFM vision dependencies separately.
-7. Restart Hermes and verify the selected model, normal tools, checkpointing, and provider path.
+5. Copy `plugins/glm-codex-effort` to `~/.hermes/plugins/glm-codex-effort` when using GLM 5.3.
+6. Apply the overlay only when its clean-check succeeds.
+7. Install StateM and the optional LFM vision dependencies separately.
+8. Restart Hermes and verify the selected model, normal tools, checkpointing, and provider path.
 
 Review `NEEDS_ATTENTION` after every Hermes update. Do not force an overlay across an upstream conflict.

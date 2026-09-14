@@ -6,6 +6,22 @@ model:
   base_url: ${DEEPSEEK_V4_FLASH_BASE_URL}
   key_env: DEEPSEEK_V4_FLASH_API_KEY
 providers:
+  glm-5.3-flash:
+    name: GLM-5.3 Flash (OpenAI-compatible Spark/vLLM)
+    base_url: ${GLM_FLASH_BASE_URL}
+    model: glm-5.3-flash-exl3-dspark
+    discover_models: false
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: true
+        reasoning_effort: low
+        clear_thinking: true
+    models:
+      glm-5.3-flash-exl3-dspark:
+        context_length: 1048576
+        stale_timeout_seconds: 21600
+        timeout_seconds: 21600
+    key_env: GLM_FLASH_API_KEY
   deepseek-v4-flash:
     name: DeepSeek V4 Flash 0731
     base_url: ${DEEPSEEK_V4_FLASH_BASE_URL}
@@ -75,6 +91,12 @@ agent:
     hard_stop_enabled: true
     cross_turn_identical_block_after: 3
     max_consecutive_read_only: 12
+    max_tool_only_iterations: 4
+    work_tool_only_halt_after: 24
+    housekeeping_tool_only_halt_after: 2
+    commentary_gate_after: 2
+    stale_anchor_block_after: 1
+    ping_max_tool_only: 0
     warn_after:
       exact_failure: 2
       same_tool_failure: 2
@@ -89,6 +111,8 @@ agent:
   disabled_toolsets: []
   verbose: false
   reasoning_effort: max
+  reasoning_overrides:
+    glm-5.3-flash-exl3-dspark: low
   system_prompt: 'TOOL EXECUTION POLICY:
 
     - Emit native tool arguments directly. Never wrap them inside an "arguments" field.
@@ -217,6 +241,8 @@ compression:
   codex_gpt55_autoraise: true
   codex_app_server_auto: native
   idle_compact_after_seconds: 0
+  context_timeout_seconds: 1800
+  context_total_ceiling_seconds: 21600
 prompt_caching:
   cache_ttl: 5m
 auxiliary:
@@ -274,7 +300,29 @@ delegation:
 skills:
   creation_nudge_interval: 15
 command_allowlist:
+  - execute_code
   - script execution via -e/-c flag
+plugins:
+  enabled:
+    - glm-codex-effort
+  disabled: []
+  entries:
+    glm-codex-effort:
+      enabled: true
+    omp-coding:
+      allow_tool_override: false
+      enabled: false
+      routing_mode: manual
+      command: ${OMP_BIN}
+      timeout_seconds: 1800
+      detached_hard_timeout_seconds: 21600
+      repair_budget: 2
+      worktree_root: ${HERMES_HOME}/omp-worktrees
+      retain_worktrees: true
+      detached_host: ${OMP_DETACHED_HOST}
+      detached_command: ${OMP_DETACHED_COMMAND}
+      detached_worker_root: ${OMP_DETACHED_WORKER_ROOT}
+      detached_start_timeout_seconds: 90
 code_execution:
   timeout: 300
   max_tool_calls: 8

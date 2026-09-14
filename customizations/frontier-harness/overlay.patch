@@ -1,891 +1,389 @@
-diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
-index 2744c1b72da..5de8f61d4be 100644
---- a/agent/agent_runtime_helpers.py
-+++ b/agent/agent_runtime_helpers.py
-@@ -376,7 +376,7 @@ def sanitize_tool_call_arguments(
-                 continue
- 
-             try:
--                json.loads(arguments)
-+                parsed_arguments = json.loads(arguments)
-             except json.JSONDecodeError:
-                 # Use the canonical ``call_id || id`` precedence so both the
-                 # scan for an existing tool result and any inserted stub key
-@@ -432,6 +432,28 @@ def sanitize_tool_call_arguments(
-                     _prepend_marker(existing_tool_msg)
- 
-                 repaired += 1
-+            else:
-+                from agent.tool_argument_normalization import normalize_tool_arguments
-+
-+                normalized_arguments, wrapper_repaired = normalize_tool_arguments(
-+                    function.get("name"),
-+                    parsed_arguments,
-+                )
-+                if wrapper_repaired:
-+                    function_name = function.get("name", "?")
-+                    function["arguments"] = json.dumps(
-+                        normalized_arguments,
-+                        ensure_ascii=False,
-+                        separators=(",", ":"),
-+                    )
-+                    log.warning(
-+                        "Unwrapped nested tool_call argument envelope before request "
-+                        "(session=%s, message_index=%s, function=%s)",
-+                        session_id or "-",
-+                        message_index,
-+                        function_name,
-+                    )
-+                    repaired += 1
- 
-         message_index += 1
- 
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
-index 7af486dc5bb..fa6028a32cd 100644
+index acddfbf722..4433da0b6e 100644
 --- a/agent/chat_completion_helpers.py
 +++ b/agent/chat_completion_helpers.py
-@@ -5061,6 +5061,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
-             "Local provider detected (%s) — stale stream timeout set to %.0fs",
-             agent.base_url, _stream_stale_timeout,
-         )
-+    elif _cfg_stale is not None:
-+        # Explicit per-model/provider stale timeouts are authoritative. Context
-+        # scaling and reasoning-model floors below are fallback safeguards only.
-+        _stream_stale_timeout = _stream_stale_timeout_base
-     else:
-         # Scale the stale timeout for large contexts: slow models (like Opus)
-         # can legitimately think for minutes before producing the first token
-@@ -5079,8 +5083,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
-         # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
-         # model threshold during their thinking phase.  The cloud gateway
-         # upstream kills the socket first, surfacing as BrokenPipeError.
--        # Raises the floor only — never overrides explicit user config
--        # (handled by get_provider_stale_timeout above).
-+        # Raises the default floor only. Explicit user config returned by
-+        # get_provider_stale_timeout is handled by the branch above.
-         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
-         if _reasoning_floor is not None:
-diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 951b8747010..6b3fcd7240f 100644
---- a/agent/conversation_loop.py
-+++ b/agent/conversation_loop.py
-@@ -1894,6 +1894,22 @@ def run_conversation(
-     _should_review_memory = _ctx.should_review_memory
-     _plugin_user_context = _ctx.plugin_user_context
-     _ext_prefetch_cache = _ctx.ext_prefetch_cache
-+    agent._clarification_wait = None
+@@ -507,6 +507,54 @@ def _codex_wait_notice_recovery(*, stale_timeout: float, ttfb_enabled: bool, ttf
+     return f"; auto-reconnect at {int(min(deadlines))}s"
+ 
+ 
++def _provider_wait_notice(
++    *, model: object, elapsed: float, recovery: str = "", streaming: bool
++) -> str:
++    """Describe a quiet but still-active provider request without implying failure.
 +
-+    try:
-+        from agent.statem_runtime import begin_turn_protocol
-+        _frontier_protocol, _frontier_generation = begin_turn_protocol(agent, turn_id)
-+    except Exception:
-+        _frontier_protocol, _frontier_generation = None, None
++    A live worker with no displayable delta is not evidence that the provider is
++    overloaded. In particular, OpenAI-compatible local reasoning servers may
++    buffer reasoning and tool-call JSON until the response is complete. Keep
++    the genuine reconnect deadline visible, but reserve failure language for
++    the watchdog branch that actually crosses that deadline.
++    """
++    model_label = str(model or "the provider")
++    elapsed_seconds = max(0, int(elapsed))
++    if streaming:
++        detail = (
++            "Reasoning will appear automatically if the backend streams it"
++        )
++    else:
++        detail = "This API returns displayable output only when its response arrives"
++    recovery_text = str(recovery or "").strip()
++    if recovery_text and not recovery_text.startswith(";"):
++        recovery_text = "; " + recovery_text
++    return (
++        f"⏳ waiting on {model_label} — request active; no visible output after "
++        f"{elapsed_seconds}s. {detail}{recovery_text}."
++    )
 +
-+    # A clarification/authorization wait may only be released by a real new
-+    # user turn. Synthetic continuations and model retries cannot self-approve.
-+    if not persist_user_display_kind:
-+        try:
-+            from agent.statem_runtime import observe_user_turn
-+            observe_user_turn(agent, original_user_message, turn_id)
-+        except Exception:
-+            logger.debug("StateM user-turn observation failed", exc_info=True)
- 
-     # Commentary deduplication spans all provider continuations and tool calls
-     # within one user turn, but must not suppress the same phrase next turn.
-@@ -1978,6 +1994,26 @@ def run_conversation(
-         )
- 
-     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-+        try:
-+            from agent.statem_runtime import inject_phase_packet, turn_cancelled, turn_is_stale
-+            if _frontier_generation is not None and turn_is_stale(agent, _frontier_generation):
-+                interrupted = True
-+                _turn_exit_reason = "superseded_by_new_turn"
-+                if _frontier_protocol is not None:
-+                    _frontier_protocol.finish(reason=_turn_exit_reason, interrupted=True)
-+                break
-+            if turn_cancelled(agent):
-+                interrupted = True
-+                _turn_exit_reason = "statem_paused"
-+                if _frontier_protocol is not None:
-+                    _frontier_protocol.finish(reason=_turn_exit_reason, interrupted=True)
-+                if not agent.quiet_mode:
-+                    agent._safe_print("\nStateM pause: stopping before the next model or tool action.")
-+                break
-+            inject_phase_packet(agent, messages)
-+        except Exception:
-+            logger.debug("StateM turn integration skipped", exc_info=True)
 +
-         _redirect_text = agent._drain_pending_redirect()
-         if _redirect_text:
-             _apply_active_turn_redirect(agent, messages, _redirect_text)
-@@ -1995,6 +2031,8 @@ def run_conversation(
-         if agent._interrupt_requested:
-             interrupted = True
-             _turn_exit_reason = "interrupted_by_user"
-+            if _frontier_protocol is not None:
-+                _frontier_protocol.finish(reason=_turn_exit_reason, interrupted=True)
-             if not agent.quiet_mode:
-                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
-             break
-@@ -2002,6 +2040,8 @@ def run_conversation(
-         api_call_count += 1
-         agent._api_call_count = api_call_count
-         agent._touch_activity(f"starting API call #{api_call_count}")
-+        if _frontier_protocol is not None:
-+            _frontier_protocol.transition("provider_wait", call=api_call_count)
- 
-         # Grace call: the budget is exhausted but we gave the model one
-         # more chance.  Consume the grace flag so the loop exits after
-@@ -2633,6 +2673,10 @@ def run_conversation(
-             if _moa_prepared_request is not None:
-                 pending_moa_prepared_request = _moa_prepared_request
-             compression_attempts += 1
-+            if _frontier_protocol is not None:
-+                _frontier_protocol.transition(
-+                    "compaction", attempt=compression_attempts, max_attempts=max_compression_attempts
-+                )
-             # Compression is actually running (block cleared / was never
-             # blocked) — reset the blocked-overflow warning dedup so a future
-             # blocked-over-threshold turn can warn again. Mirrors the
-@@ -7348,7 +7392,16 @@ def run_conversation(
-                     except Exception:
-                         pass
- 
-+                # Remember where this batch's tool results begin so a
-+                # successful self-draining maintenance launch can hand off
-+                # without asking the endpoint it just drained for another
-+                # model turn.
-+                _tool_results_start = len(messages)
-+                if _frontier_protocol is not None:
-+                    _frontier_protocol.transition(
-+                        "tool_execution", count=len(assistant_message.tool_calls)
-+                    )
-                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
-+                if _frontier_protocol is not None:
-+                    _frontier_protocol.transition(
-+                        "tool_execution",
-+                        status="completed",
-+                        count=len(assistant_message.tool_calls),
-+                    )
- 
-                 if getattr(agent, "_incremental_persistence_failed", False):
-                     # A tool result could not be made canonical. Do not send
-@@ -7359,6 +7412,76 @@ def run_conversation(
-                     failed = True
-                     break
- 
-+                # Atlas maintenance intentionally drains the DeepSeek gateway
-+                # before relaunching the serving stack.  Once its detached
-+                # runner has launched successfully, another API call from this
-+                # same turn can only race the drained endpoint and surface a
-+                # misleading HTTP 502.  Treat the successful launch as a
-+                # terminal handoff instead.  Keep the signature deliberately
-+                # narrow so ordinary background terminal jobs are unaffected.
-+                _atlas_maintenance_handoff = False
-+                for _tool_msg in messages[_tool_results_start:]:
-+                    if not isinstance(_tool_msg, dict):
-+                        continue
-+                    if _tool_msg.get("role") != "tool" or _tool_msg.get("name") != "terminal":
-+                        continue
-+                    _tool_content = str(_tool_msg.get("content") or "")
-+                    if (
-+                        "controlplane_maintenance/live-" in _tool_content
-+                        and "LAUNCHED_PID=" in _tool_content
-+                        and '"phase": "drain"' in _tool_content
-+                        and '"exit_code": 0' in _tool_content
-+                    ):
-+                        _atlas_maintenance_handoff = True
-+                        break
++_QUIET_WAIT_PLATFORMS = frozenset({"desktop", "tui"})
 +
-+                if _atlas_maintenance_handoff:
-+                    _turn_exit_reason = "atlas_maintenance_handoff"
-+                    final_response = (
-+                        "Atlas maintenance launched successfully in the background. "
-+                        "DeepSeek is temporarily unavailable while its gateway is "
-+                        "drained, so this turn is ending cleanly instead of retrying "
-+                        "the offline endpoint."
-+                    )
-+                    append_message(messages, {
-+                        "role": "assistant",
-+                        "content": final_response,
-+                        "finish_reason": "maintenance_handoff",
-+                    })
-+                    agent._emit_status("Atlas maintenance running; DeepSeek temporarily unavailable")
-+                    agent._safe_print(f"\n{final_response}\n")
-+                    if agent.stream_delta_callback:
-+                        try:
-+                            agent.stream_delta_callback(final_response)
-+                            agent.stream_delta_callback(None)
-+                        except Exception:
-+                            pass
-+                    break
 +
-+                _clarification_wait = getattr(agent, "_clarification_wait", None)
-+                if isinstance(_clarification_wait, dict):
-+                    question = str(_clarification_wait.get("question") or "Clarification is required before continuing.")
-+                    choices = [str(item) for item in (_clarification_wait.get("choices") or []) if str(item).strip()]
-+                    suffix = ""
-+                    if choices:
-+                        suffix = "\n\nOptions: " + "; ".join(choices)
-+                    final_response = f"Clarification required before I continue: {question}{suffix}"
-+                    _turn_exit_reason = "clarification_required"
-+                    append_message(messages, {
-+                        "role": "assistant",
-+                        "content": final_response,
-+                        "finish_reason": "clarification_required",
-+                    })
-+                    agent._emit_status("Waiting for user clarification")
-+                    agent._safe_print(f"\n{final_response}\n")
-+                    if agent.stream_delta_callback:
-+                        try:
-+                            agent.stream_delta_callback(final_response)
-+                            agent.stream_delta_callback(None)
-+                        except Exception:
-+                            pass
-+                    break
++def _surface_countdown_wait(agent, notice: str) -> None:
++    """Keep the inactivity heartbeat; skip countdown banners on Desktop/TUI.
 +
-                 if agent._tool_guardrail_halt_decision is not None:
-                     decision = agent._tool_guardrail_halt_decision
-                     _turn_exit_reason = "guardrail_halt"
-@@ -8413,6 +8536,9 @@ def run_conversation(
-     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
-     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
-     # result dict is returned exactly as before.
-+    if _frontier_protocol is not None and _frontier_protocol.phase not in {"terminal", "interrupted"}:
-+        _frontier_protocol.finish(reason=_turn_exit_reason, interrupted=interrupted)
++    Those surfaces already show a pulse plus an elapsed timer. Repeating
++    ``waiting on … after 30s/60s/90s`` is not Frontier-like and does not
++    make prefill faster. CLI still rewrites the spinner. Reconnect and
++    incomplete-response notices still go through ``_emit_wait_notice``.
++    """
++    platform = str(getattr(agent, "platform", "") or "").lower()
++    if platform in _QUIET_WAIT_PLATFORMS:
++        touch = getattr(agent, "_touch_activity", None)
++        if callable(touch):
++            touch(notice)
++        return
++    agent._emit_wait_notice(notice)
 +
-     return finalize_turn(
-         agent,
-         final_response=final_response,
-diff --git a/agent/tool_executor.py b/agent/tool_executor.py
-index e7bb9126db5..650434ca8d9 100644
---- a/agent/tool_executor.py
-+++ b/agent/tool_executor.py
-@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
- from __future__ import annotations
- 
- import concurrent.futures
-+import fnmatch
- import json
- from pathlib import Path
- import logging
-@@ -161,13 +162,19 @@ class _BatchAbandoned(BaseException):
-     """
- 
- 
--def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
--    """Parse model-emitted arguments without repairing or coercing them."""
-+def _parse_tool_arguments(
-+    raw_arguments: Any,
-+    tool_name: str | None = None,
-+) -> tuple[dict, Optional[str]]:
-+    """Parse model-emitted arguments and remove transport-envelope nesting."""
-     try:
-         arguments = json.loads(raw_arguments)
-     except (json.JSONDecodeError, TypeError):
-         arguments = None
-     if isinstance(arguments, dict):
-+        from agent.tool_argument_normalization import normalize_tool_arguments
 +
-+        arguments, _ = normalize_tool_arguments(tool_name, arguments)
-         return arguments, None
-     return {}, json.dumps(
-         {
-@@ -180,6 +187,116 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
+ # ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
+ # A session wedged against an unresponsive provider would otherwise hit the
+ # stale detector on every call forever. ``agent._consecutive_stale_streams``
+@@ -1359,6 +1407,36 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
      )
  
  
-+_FALLBACK_REQUIRED_TOOL_FIELDS = {
-+    "read_file": ("path",),
-+    "write_file": ("path", "content"),
-+    "patch": ("path",),
-+    "terminal": ("command",),
-+    "execute_code": ("code",),
-+    "search_files": ("query",),
-+    "vision_analyze": ("image",),
-+    "clarify": ("question",),
-+}
++def _commentary_gate_omits_tools(agent) -> bool:
++    """True while a commentary-gate API call is in flight (tools must stay omitted)."""
++    try:
++        return bool(getattr(getattr(agent, "_tool_guardrails", None), "commentary_gate_active", lambda: False)())
++    except Exception:
++        return False
 +
 +
-+def _tool_parameter_schema(agent, tool_name: str) -> dict[str, Any]:
-+    """Resolve and cache the schema advertised for a native tool."""
-+    cache = getattr(agent, "_execution_governor_schema_cache", None)
-+    if not isinstance(cache, dict):
-+        cache = {}
++def _apply_commentary_gate_to_tools(agent, tools_for_api):
++    """None means default tools; an active commentary gate always forces an omitted list."""
++    if _commentary_gate_omits_tools(agent):
++        return []
++    if tools_for_api is None:
++        return agent.tools
++    return tools_for_api
++
++
++def _strip_tools_from_kwargs_for_commentary_gate(agent, kwargs: dict) -> dict:
++    """Drop tools from a built request so a later builder cannot restore them."""
++    if not _commentary_gate_omits_tools(agent) or not isinstance(kwargs, dict):
++        return kwargs
++    kwargs.pop("tools", None)
++    kwargs.pop("functions", None)
++    extra = kwargs.get("extra_body")
++    if isinstance(extra, dict):
++        extra.pop("tools", None)
++        extra.pop("functions", None)
++    return kwargs
++
++
+ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+     """Build the keyword arguments dict for the active API mode.
+ 
+@@ -1382,20 +1460,27 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list |
+     # One-shot continuation override — consumed exactly once, on the FIRST
+     # request this call builds (only one api_mode branch runs per invocation).
+     reasoning_config = _reasoning_config_for_wire(agent)
+-    if tools_for_api is None:
+-        tools_for_api = agent.tools
++    tools_for_api = _apply_commentary_gate_to_tools(agent, tools_for_api)
+     # The one place request_overrides are consumed: static /fast values are already pinned
+     # in agent.request_overrides; auto/cold windows layer the fast override per request.
+     request_overrides = effective_request_overrides(agent)
+     if agent.api_mode == "anthropic_messages":
+-        return _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
++        return _strip_tools_from_kwargs_for_commentary_gate(
++            agent,
++            _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides),
++        )
+     if agent.api_mode == "bedrock_converse":
+-        return _build_bedrock_kwargs(agent, api_messages, tools_for_api)
++        return _strip_tools_from_kwargs_for_commentary_gate(
++            agent, _build_bedrock_kwargs(agent, api_messages, tools_for_api),
++        )
+     # Rotation-stable logical cache scope shared by every OpenAI-wire branch
+     # (memoized on the agent); anthropic/bedrock above don't use it.
+     cache_scope_id = _prompt_cache_scope_for_agent(agent)
+     builder = _build_codex_kwargs if agent.api_mode == "codex_responses" else _build_chat_completions_kwargs
+-    return builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
++    return _strip_tools_from_kwargs_for_commentary_gate(
++        agent,
++        builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id),
++    )
+ 
+ 
+ def _model_dump_safe(obj):
+diff --git a/agent/chat_completion_nonstream.py b/agent/chat_completion_nonstream.py
+index f9edbfcb01..ce06e1227f 100644
+--- a/agent/chat_completion_nonstream.py
++++ b/agent/chat_completion_nonstream.py
+@@ -157,9 +157,15 @@ class _NonStreamRequest:
+                 elapsed=elapsed)
+             if recovery and activity_ts is not None:
+                 recovery += " total elapsed"
+-            self.agent._emit_wait_notice(
+-                f"⏳ waiting on {self.api_kwargs.get('model', 'the provider')} — "
+-                f"{int(silence)}s with {status} (provider may be slow or overloaded{recovery})")
++            h._surface_countdown_wait(
++                self.agent,
++                h._provider_wait_notice(
++                    model=self.api_kwargs.get("model", "the provider"),
++                    elapsed=elapsed,
++                    recovery=recovery,
++                    streaming=False,
++                ),
++            )
+             self.wait_notice_started_ts = self.call_start + elapsed
+         except Exception:
+             h.logger.debug("wait-notice construction failed", exc_info=True)
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 6739c096e4..af35f302ad 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1117,9 +1117,19 @@ def _redecorate_prompt_cache_for_provider(
+         messages = _peel_moa_guidance(messages, guidance)
+ 
+     strip_anthropic_cache_control(messages)
+-    planned_tools = strip_anthropic_tool_cache_control(
+-        tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
+-    )
++    gate_omits_tools = False
++    try:
++        gate_omits_tools = bool(
++            getattr(getattr(agent, "_tool_guardrails", None), "commentary_gate_active", lambda: False)()
++        )
++    except Exception:
++        gate_omits_tools = False
++    if gate_omits_tools:
++        planned_tools = []
++    else:
++        planned_tools = strip_anthropic_tool_cache_control(
++            tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
++        )
+     if prepared is not None and getattr(agent, "provider", None) == "moa":
+         # Prepared MoA state is canonical: the synchronous acting-aggregator
+         # sender owns its destination-local cache plan after it resolves the slot.
+@@ -1153,11 +1163,60 @@ def _redecorate_prompt_cache_for_provider(
+         )
+         messages, planned_tools = plan.messages, plan.tools
+ 
++    if gate_omits_tools:
++        planned_tools = []
++        return messages, prepared, planned_tools
+     if tools_for_api is None:
+         return messages, prepared
+     return messages, prepared, planned_tools
+ 
+ 
++def _phase_after_commentary_gate(agent, assistant_message):
++    """Choose ``run_tool_round`` or ``finish_text_response`` after a commentary-gate call.
++
++    Codex: visible mid-turn speech is commentary, not ``final_answer``. If a tools-off
++    call still emitted tool_calls with no visible status, drop them so empty/commentary
++    recovery runs instead of executing tools (which would leave the gate stuck active).
++    Visible text plus tool_calls is preamble+tools: close the gate, then execute.
++    """
++    tool_calls = getattr(assistant_message, "tool_calls", None)
++    gate_active = False
++    try:
++        gate_active = bool(
++            getattr(getattr(agent, "_tool_guardrails", None), "commentary_gate_active", lambda: False)()
++        )
++    except Exception:
++        gate_active = False
++    if gate_active and tool_calls:
++        raw = getattr(assistant_message, "content", None) or ""
++        if not isinstance(raw, str):
++            raw = ""
++        strip = getattr(agent, "_strip_think_blocks", None)
 +        try:
-+            import model_tools
-+            for definition in model_tools.get_tool_definitions(
-+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-+                quiet_mode=True,
-+            ) or []:
-+                function = definition.get("function", definition) if isinstance(definition, dict) else {}
-+                name = function.get("name") if isinstance(function, dict) else None
-+                schema = (
-+                    function.get("parameters") or function.get("input_schema")
-+                    if isinstance(function, dict) else None
-+                )
-+                if isinstance(name, str) and isinstance(schema, dict):
-+                    cache[name] = schema
++            visible = (strip(raw) if callable(strip) else raw).strip()
++        except Exception:
++            visible = raw.strip()
++        if visible:
++            try:
++                finish = getattr(getattr(agent, "_tool_guardrails", None), "finish_commentary_request", None)
++                if callable(finish):
++                    finish(has_visible_text=True)
++            except Exception:
++                logger.debug("Commentary gate preamble finish failed", exc_info=True)
++            return run_tool_round
++        try:
++            assistant_message.tool_calls = None
 +        except Exception:
 +            pass
-+        agent._execution_governor_schema_cache = cache
-+    schema = cache.get(tool_name)
-+    return schema if isinstance(schema, dict) else {}
-+
-+
-+def _execution_governor_config(agent) -> dict[str, Any]:
-+    cached = getattr(agent, "_execution_governor_config", None)
-+    if isinstance(cached, dict):
-+        return cached
-+    config: dict[str, Any] = {}
-+    try:
-+        from hermes_cli.config import load_config
-+        loaded = load_config() or {}
-+        agent_config = loaded.get("agent", {}) if isinstance(loaded, dict) else {}
-+        config = agent_config.get("execution_governor", {}) if isinstance(agent_config, dict) else {}
-+    except Exception:
-+        pass
-+    config = config if isinstance(config, dict) else {}
-+    agent._execution_governor_config = config
-+    return config
-+
-+
-+def _execution_governor_preflight(agent, tool_name: str, args: dict[str, Any]) -> Optional[str]:
-+    """Reject malformed or protected calls before middleware dispatch.
-+
-+    StateM remains responsible for phase transitions. This validates the
-+    proposed native action at the execution boundary.
-+    """
-+    policy = _execution_governor_config(agent)
-+    if not policy.get("enabled", True):
-+        return None
-+
-+    schema = _tool_parameter_schema(agent, tool_name)
-+    required = schema.get("required", ()) if schema else _FALLBACK_REQUIRED_TOOL_FIELDS.get(tool_name, ())
-+    if isinstance(required, (list, tuple)):
-+        missing = [key for key in required if key not in args or args.get(key) is None or args.get(key) == ""]
-+        if missing:
-+            return (
-+                f"Execution governor rejected {tool_name}: missing required field(s) "
-+                f"{', '.join(missing)}. The tool was not executed. Supply only the "
-+                "required schema fields and retry once."
-+            )
-+
-+    properties = schema.get("properties", {}) if schema else {}
-+    if isinstance(properties, dict):
-+        expected = {
-+            "string": str,
-+            "integer": int,
-+            "number": (int, float),
-+            "boolean": bool,
-+            "array": list,
-+            "object": dict,
-+        }
-+        for key, value in args.items():
-+            spec = properties.get(key)
-+            kind = spec.get("type") if isinstance(spec, dict) else None
-+            python_type = expected.get(kind)
-+            if python_type and not isinstance(value, python_type):
-+                return (
-+                    f"Execution governor rejected {tool_name}: field '{key}' must be "
-+                    f"{kind}, received {type(value).__name__}. The tool was not executed."
-+                )
-+
-+    patterns = policy.get("protected_path_patterns", ())
-+    if isinstance(patterns, list):
-+        argument_text = json.dumps(args, ensure_ascii=False, default=str)
-+        for pattern in patterns:
-+            if isinstance(pattern, str) and pattern and fnmatch.fnmatch(argument_text, f"*{pattern}*"):
-+                return (
-+                    f"Execution governor denied {tool_name}: the requested argument matches "
-+                    "a protected authorization path. Ask the operator through the approval "
-+                    "channel; never read or harvest approval tokens."
-+                )
-+    return None
-+
-+
- def _resolve_concurrent_tool_timeout() -> float | None:
-     """Resolve the per-batch concurrent tool deadline.
- 
-@@ -310,6 +427,15 @@ def _emit_terminal_post_tool_call(
-         )
-     except Exception:
-         pass
-+    try:
-+        from agent.statem_runtime import record_tool_result
-+        record_tool_result(
-+            agent, function_name, function_args, result, status=status,
-+            error_type=error_type, error_message=error_message,
-+            duration_ms=duration_ms,
++        logger.info(
++            "Commentary gate: dropping tool_calls with no visible status "
++            "(session=%s)",
++            getattr(agent, "session_id", None) or "none",
 +        )
++        return finish_text_response
++    return run_tool_round if tool_calls else finish_text_response
++
++
+ def _engine_overrides_hook(engine: Any, name: str) -> bool:
+     """True when ``engine`` implements ContextEngine hook ``name`` itself.
+ 
+@@ -1482,6 +1541,28 @@ def _run_conversation_turn(
+     except PreflightCompressionTimedOut as _preflight_timeout_exc:
+         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+ 
++    try:
++        from agent.statem_runtime import begin_turn_protocol
++        agent._frontier_protocol, agent._frontier_generation = begin_turn_protocol(agent, _ctx.turn_id)
 +    except Exception:
-+        pass
- 
- 
- def _cancelled_tool_result(reason: str = "user interrupt") -> str:
-@@ -618,6 +744,16 @@ def _run_agent_tool_execution_middleware(
- 
-         block_message = scope_block
-         block_error_type = "tool_scope_block"
-+        if block_message is None:
-+            try:
-+                from agent.statem_runtime import preflight_tool
-+                block_message = preflight_tool(
-+                    agent, function_name, final_args, effective_task_id,
-+                )
-+                if block_message is not None:
-+                    block_error_type = "statem_policy_block"
-+            except Exception:
-+                pass
-         if block_message is None:
-             block_error_type = "plugin_block"
- 
-@@ -1124,7 +1260,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
-         function_name = tool_call.function.name
- 
-         function_args, malformed_args_result = _parse_tool_arguments(
--            tool_call.function.arguments
-+            tool_call.function.arguments,
-+            function_name,
++        agent._frontier_protocol = agent._frontier_generation = None
++        logger.debug("StateM turn protocol start failed", exc_info=True)
++    if not persist_user_display_kind:
++        try:
++            from agent.statem_runtime import observe_user_turn
++            observe_user_turn(agent, _ctx.original_user_message, _ctx.turn_id)
++        except Exception:
++            logger.debug("StateM user-turn observation failed", exc_info=True)
++    try:
++        _goal_text = _ctx.original_user_message
++        if not isinstance(_goal_text, str):
++            _goal_text = ""
++        observe_goal = getattr(agent._tool_guardrails, "observe_user_goal", None)
++        if callable(observe_goal):
++            observe_goal(_goal_text)
++    except Exception:
++        logger.debug("Tool-only brake user-goal observation failed", exc_info=True)
++
+     # Per-turn agent state (the gateway caches agents across turns, so none of this may
+     # leak into the next message): interim-commentary dedup spans the whole turn but not
+     # the next; a SessionDB append failure (and its classified cause) halts only this turn;
+@@ -1512,6 +1593,24 @@ def _run_conversation_turn(
          )
  
-         if malformed_args_result is not None:
-@@ -1180,6 +1317,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
-         except Exception:
-             pass
- 
-+        if _ts_scope_block is None:
-+            _ts_scope_block = _execution_governor_preflight(
-+                agent, function_name, function_args
-+            )
-+
-         parsed_calls.append(
-             (tool_call, function_name, function_args, [], None, _ts_scope_block)
-         )
-@@ -1973,7 +2115,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
-         function_name = tool_call.function.name
- 
-         function_args, malformed_args_result = _parse_tool_arguments(
--            tool_call.function.arguments
-+            tool_call.function.arguments,
-+            function_name,
-         )
-         if malformed_args_result is not None:
-             _emit_terminal_post_tool_call(
-@@ -2039,6 +2182,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
-         except Exception:
-             pass
- 
-+        if _ts_scope_block is None:
-+            _ts_scope_block = _execution_governor_preflight(
-+                agent, function_name, function_args
-+            )
-+
-         middleware_trace: list[dict[str, Any]] = []
-         _execution_blocked = False
-         _execution_dispatched = False
-@@ -2063,6 +2211,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
-                 scope_block=_ts_scope_block,
-                 display_index=i,
-             ))
-+            if (
-+                "__HERMES_DEFERRED_USER_RESPONSE__" in str(function_result)
-+                or "Clarify tool is not available in this execution context" in str(function_result)
-+            ):
-+                agent._clarification_wait = {
-+                    "question": str(function_args.get("question") or "Clarification is required before continuing.")[:2000],
-+                    "choices": list(function_args.get("choices") or [])[:4],
-+                    "multi_select": bool(function_args.get("multi_select", False)),
-+                }
-             tool_duration = time.time() - tool_start_time
-             if agent._should_emit_quiet_tool_messages():
-                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
-diff --git a/agent/tool_guardrails.py b/agent/tool_guardrails.py
-index e4afbbba822..9c20dca04cc 100644
---- a/agent/tool_guardrails.py
-+++ b/agent/tool_guardrails.py
-@@ -123,6 +123,8 @@ class ToolCallGuardrailConfig:
-     same_tool_failure_halt_after: int = 8
-     no_progress_warn_after: int = 2
-     no_progress_block_after: int = 5
-+    cross_turn_identical_block_after: int = 3
-+    max_consecutive_read_only: int = 12
-     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
-     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
-     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
-@@ -168,6 +170,14 @@ class ToolCallGuardrailConfig:
-                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
-                 defaults.no_progress_block_after,
-             ),
-+            cross_turn_identical_block_after=_positive_int(
-+                data.get("cross_turn_identical_block_after"),
-+                defaults.cross_turn_identical_block_after,
-+            ),
-+            max_consecutive_read_only=_positive_int(
-+                data.get("max_consecutive_read_only"),
-+                defaults.max_consecutive_read_only,
-+            ),
-             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
-         )
- 
-@@ -336,6 +346,13 @@ class ToolCallGuardrailController:
- 
-     def __init__(self, config: ToolCallGuardrailConfig | None = None):
-         self.config = config or ToolCallGuardrailConfig()
-+        # Session-wide state survives reset_for_turn(). StateM owns phase
-+        # transitions; this only prevents unchanged calls from looping across
-+        # those transitions.
-+        self._session_identical_sig: ToolCallSignature | None = None
-+        self._session_identical_result_hash = ""
-+        self._session_identical_count = 0
-+        self._session_read_only_streak = 0
-         self.reset_for_turn()
- 
-     def reset_for_turn(self) -> None:
-@@ -368,11 +385,37 @@ class ToolCallGuardrailController:
-         # single agent loop rather than accumulating across the session.
-         self._turn_web_search_count = 0
-         self._turn_subagent_count = 0
-+        # A recoverable block is returned to the model once so it can change
-+        # strategy. Only a repeated attempt to cross the same block halts the
-+        # turn, preserving a final-response budget without allowing loops.
-+        self._recovery_block_counts: dict[ToolCallSignature, int] = {}
- 
-     @property
-     def halt_decision(self) -> ToolGuardrailDecision | None:
-         return self._halt_decision
- 
-+    def _recoverable_block(self, decision: ToolGuardrailDecision) -> ToolGuardrailDecision:
-+        signature = decision.signature
-+        if signature is None:
-+            return decision
-+        count = self._recovery_block_counts.get(signature, 0) + 1
-+        self._recovery_block_counts[signature] = count
-+        if count < 2:
-+            return decision
-+        halted = ToolGuardrailDecision(
-+            action="halt",
-+            code=f"{decision.code}_repeated",
-+            message=(
-+                f"{decision.message} The model attempted to cross the same guardrail again; "
-+                "execution is ending with a retained-state handoff."
-+            ),
-+            tool_name=decision.tool_name,
-+            count=count,
-+            signature=signature,
-+        )
-+        self._halt_decision = halted
-+        return halted
-+
-     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
- 
-@@ -386,6 +429,47 @@ class ToolCallGuardrailController:
-         if cap_block is not None:
-             return cap_block
- 
-+        if self.config.hard_stop_enabled:
-+            if (
-+                not is_stall_guard_repeatable(tool_name)
-+                and self._session_identical_sig == signature
-+                and self._session_identical_count >= self.config.cross_turn_identical_block_after
-+            ):
-+                decision = ToolGuardrailDecision(
-+                    action="block",
-+                    code="cross_turn_identical_call_block",
-+                    message=(
-+                        f"Blocked {tool_name}: the same call has already returned the same "
-+                        f"result {self._session_identical_count} consecutive times across this "
-+                        "session. Do not retry unchanged; change strategy, verify a state change, "
-+                        "or report the blocker."
-+                    ),
-+                    tool_name=tool_name,
-+                    count=self._session_identical_count,
-+                    signature=signature,
-+                )
-+                return self._recoverable_block(decision)
-+
-+            if self._is_idempotent(tool_name):
-+                if self._session_read_only_streak >= self.config.max_consecutive_read_only:
-+                    decision = ToolGuardrailDecision(
-+                        action="block",
-+                        code="read_only_budget_block",
-+                        message=(
-+                            f"Blocked {tool_name}: this session has made "
-+                            f"{self._session_read_only_streak} consecutive read-only calls. "
-+                            "Stop exploring and either execute the approved plan, verify the work, "
-+                            "or report the specific blocker."
-+                        ),
-+                        tool_name=tool_name,
-+                        count=self._session_read_only_streak,
-+                        signature=signature,
-+                    )
-+                    return self._recoverable_block(decision)
-+                self._session_read_only_streak += 1
-+            else:
-+                self._session_read_only_streak = 0
-+
-         if not self.config.hard_stop_enabled:
-             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
- 
-@@ -403,8 +487,7 @@ class ToolCallGuardrailController:
-                 count=exact_count,
-                 signature=signature,
+     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
++        try:
++            from agent.statem_runtime import turn_cancelled, turn_is_stale
++            _generation = getattr(agent, "_frontier_generation", None)
++            _protocol = getattr(agent, "_frontier_protocol", None)
++            if _generation is not None and turn_is_stale(agent, _generation):
++                s._turn_exit_reason = "superseded_by_new_turn"
++                if _protocol is not None:
++                    _protocol.finish(reason=s._turn_exit_reason, interrupted=True)
++                break
++            if turn_cancelled(agent):
++                s._turn_exit_reason = "statem_paused"
++                if _protocol is not None:
++                    _protocol.finish(reason=s._turn_exit_reason, interrupted=True)
++                if not agent.quiet_mode:
++                    agent._safe_print("\nStateM pause: stopping before the next model or tool action.")
++                break
++        except Exception:
++            logger.debug("StateM turn-liveness check failed", exc_info=True)
+         if _run_phase(begin_iteration, agent, s).action == "break":
+             break
+         _run_phase(prepare_iteration, agent, s)
+@@ -1546,7 +1645,7 @@ def _run_conversation_turn(
+             if _ri.action == "continue":
+                 continue
+             _v = _run_phase(
+-                run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
++                _phase_after_commentary_gate(agent, s.assistant_message), agent, s
              )
--            self._halt_decision = decision
--            return decision
-+            return self._recoverable_block(decision)
+             if _v.action == "return":
+                 return _v.result
+diff --git a/agent/empty_response_guard.py b/agent/empty_response_guard.py
+index 1d8a563db0..1fba02544e 100644
+--- a/agent/empty_response_guard.py
++++ b/agent/empty_response_guard.py
+@@ -45,6 +45,7 @@ Per project policy, no ``HERMES_*`` environment variables are involved —
+ from __future__ import annotations
  
-         if self._is_idempotent(tool_name):
-             record = self._no_progress.get(signature)
-@@ -423,8 +506,7 @@ class ToolCallGuardrailController:
-                         count=repeat_count,
-                         signature=signature,
-                     )
--                    self._halt_decision = decision
--                    return decision
-+                    return self._recoverable_block(decision)
+ import logging
++import secrets
+ from dataclasses import dataclass
+ from decimal import Decimal
+ from typing import Any, List, Optional, Tuple
+@@ -64,6 +65,64 @@ _STREAK_COST_ATTR = "_empty_streak_cost_usd"
+ _ENABLED_ATTR = "_empty_guard_enabled"
+ _THRESHOLD_ATTR = "_empty_guard_cost_threshold_usd"
  
-         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
- 
-@@ -441,6 +523,8 @@ class ToolCallGuardrailController:
-         if failed is None:
-             failed, _ = classify_tool_failure(tool_name, result)
- 
-+        self._record_session_observation(signature, result)
++_CACHE_RECOVERY_MARKER = "\n\n[Hermes fresh-continuation recovery "
 +
-         if failed:
-             exact_count = self._exact_failure_counts.get(signature, 0) + 1
-             self._exact_failure_counts[signature] = exact_count
-@@ -449,20 +533,19 @@ class ToolCallGuardrailController:
-             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
-             self._same_tool_failure_counts[tool_name] = same_count
- 
--            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
--                decision = ToolGuardrailDecision(
--                    action="halt",
--                    code="same_tool_failure_halt",
-+            if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_halt_after:
-+                return ToolGuardrailDecision(
-+                    action="warn",
-+                    code="same_tool_failure_strategy_required",
-                     message=(
--                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
--                        "Stop retrying the same failing tool path and choose a different approach."
-+                        f"{tool_name} failed {same_count} times with differing calls. "
-+                        "The tool name alone is not proof of a loop; change strategy, verify any "
-+                        "effects already produced, or provide a retained-state blocker handoff."
-                     ),
-                     tool_name=tool_name,
-                     count=same_count,
-                     signature=signature,
-                 )
--                self._halt_decision = decision
--                return decision
- 
-             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
-                 return ToolGuardrailDecision(
-@@ -492,6 +575,7 @@ class ToolCallGuardrailController:
- 
-         self._exact_failure_counts.pop(signature, None)
-         self._same_tool_failure_counts.pop(tool_name, None)
-+        self._recovery_block_counts.clear()
- 
-         if not self._is_idempotent(tool_name):
-             self._no_progress.pop(signature, None)
-@@ -525,6 +609,21 @@ class ToolCallGuardrailController:
-             return False
-         return tool_name in self.config.idempotent_tools
- 
-+    def _record_session_observation(
-+        self, signature: ToolCallSignature, result: str | None
-+    ) -> None:
-+        """Track an unchanged consecutive call/result streak across turns."""
-+        result_hash = _result_hash(result)
-+        if (
-+            self._session_identical_sig == signature
-+            and self._session_identical_result_hash == result_hash
-+        ):
-+            self._session_identical_count += 1
-+            return
-+        self._session_identical_sig = signature
-+        self._session_identical_result_hash = result_hash
-+        self._session_identical_count = 1
 +
-     def observe_identical_call(
-         self,
-         tool_name: str,
-diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
-index bec0f9a82b0..4ae5e7ca543 100644
---- a/agent/transports/chat_completions.py
-+++ b/agent/transports/chat_completions.py
-@@ -13,6 +13,7 @@ import json
- from typing import Any, Dict
- 
- from agent.lmstudio_reasoning import resolve_lmstudio_effort
-+from agent.frontier_harness import apply_frontier_request_policy
- from agent.reasoning_effort import (
-     KIMI_K3_EFFORTS,
-     KIMI_K3_OVERRIDES,
-@@ -701,6 +702,12 @@ class ChatCompletionsTransport(ProviderTransport):
-         if overrides:
-             api_kwargs.update(overrides)
- 
-+        apply_frontier_request_policy(
-+            api_kwargs,
-+            model=model,
-+            params=params,
-+        )
++def _is_openrouter_runtime(agent: Any) -> bool:
++    """Return True only for requests routed through OpenRouter."""
++    provider = str(getattr(agent, "provider", "") or "").strip().lower()
++    requested = str(
++        getattr(agent, "requested_provider", "") or ""
++    ).strip().lower()
++    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
++    return (
++        provider == "openrouter"
++        or requested == "openrouter"
++        or "openrouter.ai" in base_url
++    )
 +
-         _add_prompt_cache_key(
-             api_kwargs,
-             messages=sanitized,
-@@ -865,6 +872,12 @@ class ChatCompletionsTransport(ProviderTransport):
-             if extra_body:
-                 api_kwargs["extra_body"] = extra_body
- 
-+        apply_frontier_request_policy(
-+            api_kwargs,
-+            model=model,
-+            params=params,
-+        )
 +
-         _add_prompt_cache_key(
-             api_kwargs,
-             messages=sanitized,
-diff --git a/apps/desktop/src/store/reasoning-disclosure.ts b/apps/desktop/src/store/reasoning-disclosure.ts
-index 584c00a57ae..e2204bc5b1f 100644
---- a/apps/desktop/src/store/reasoning-disclosure.ts
-+++ b/apps/desktop/src/store/reasoning-disclosure.ts
-@@ -5,7 +5,7 @@ import { persistBoolean, storedBoolean } from '@/lib/storage'
- const REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY = 'hermes.desktop.reasoning.collapsedByDefault'
- 
- /** Desktop-local presentation preference; shared backend config must not be changed by a single window. */
--export const $reasoningCollapsedByDefault = atom(storedBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, false))
-+export const $reasoningCollapsedByDefault = atom(storedBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, true))
- 
- $reasoningCollapsedByDefault.subscribe(value => persistBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, value))
- 
-diff --git a/hermes_cli/oneshot.py b/hermes_cli/oneshot.py
-index 5167889ba55..3ef4f87741f 100644
---- a/hermes_cli/oneshot.py
-+++ b/hermes_cli/oneshot.py
-@@ -537,19 +537,5 @@ def _run_agent(
- 
- 
- def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:
--    """Clarify is disabled in oneshot mode — tell the agent to pick a
--    default and proceed instead of stalling or erroring."""
--    if choices:
--        if multi_select:
--            return (
--                f"[oneshot mode: no user available. Pick the best subset from "
--                f"{choices} using your own judgment and continue.]"
--            )
--        return (
--            f"[oneshot mode: no user available. Pick the best option from "
--            f"{choices} using your own judgment and continue.]"
--        )
--    return (
--        "[oneshot mode: no user available. Make the most reasonable "
--        "assumption you can and continue.]"
--    )
-+    """Defer clarification in non-interactive mode without inventing an answer."""
-+    return "__HERMES_DEFERRED_USER_RESPONSE__"
-diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
-index 4c6ec73b361..ef0c06ceb0a 100644
---- a/tools/code_execution_tool.py
-+++ b/tools/code_execution_tool.py
-@@ -387,6 +387,14 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
-         return None
-     window = stderr_text[:4000]
-     try:
-+        if "TimeoutExpired" in window and "/tmp/anc.js" in window:
-+            match = re.search(r"timed out after\s+([0-9.]+)\s+seconds", window)
-+            duration = f" after {match.group(1)}s" if match else ""
-+            return (
-+                f"The nested Node subprocess timed out{duration}. Remove its fixed "
-+                "timeout and let execute_code's outer timeout own the deadline; "
-+                "otherwise healthy browser/analysis work is cut off early."
-+            )
-         m = re.search(
-             r"cannot import name '(\w+)' from 'hermes_tools'", window
-         )
-@@ -428,6 +436,54 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
-     return None
- 
- 
-+def _fixed_anc_node_timeout_hint(code: str) -> Optional[str]:
-+    """Reject the known nested Node timeout anti-pattern without regex guessing.
++def cache_safe_recovery_nudge(agent: Any, content: str, attempt: int) -> str:
++    """Give an OpenRouter empty-response recovery a fresh cache key.
 +
-+    The historic failure used ``subprocess.run(["node", "/tmp/anc.js"],
-+    timeout=45)`` inside execute_code. The inner deadline fires before Hermes'
-+    outer sandbox budget and surfaces a long traceback. Only literal numeric
-+    timeouts on a literal ``/tmp/anc.js`` subprocess call are rejected.
++    OpenRouter response caching keys on the complete request body. The nonce
++    lives only in Hermes' synthetic recovery message, which is removed before
++    durable transcript projection. Normal prompts and local DeepSeek requests
++    are unchanged.
 +    """
-+    try:
-+        import ast
++    if not _is_openrouter_runtime(agent):
++        return content
++    base = str(content or "").split(_CACHE_RECOVERY_MARKER, 1)[0].rstrip()
++    session = str(getattr(agent, "session_id", "") or "session")[-16:]
++    nonce = secrets.token_hex(8)
++    return (
++        f"{base}{_CACHE_RECOVERY_MARKER}{session}:{int(attempt)}:{nonce}. "
++        "Generate a fresh continuation from the tool results; do not return "
++        "empty content.]"
++    )
 +
-+        tree = ast.parse(code)
-+    except (SyntaxError, TypeError, ValueError):
-+        return None
-+    for node in ast.walk(tree):
-+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
++
++def refresh_recovery_nudge(agent: Any, messages: List[dict], attempt: int) -> bool:
++    """Rotate the newest synthetic recovery nudge before an empty retry."""
++    if not _is_openrouter_runtime(agent):
++        return False
++    for message in reversed(messages):
++        if not isinstance(message, dict):
 +            continue
-+        owner = node.func.value
-+        if not (
-+            isinstance(owner, ast.Name)
-+            and owner.id == "subprocess"
-+            and node.func.attr in {"run", "check_call", "check_output"}
-+            and node.args
-+        ):
++        if message.get("role") != "user":
 +            continue
-+        has_anc = any(
-+            isinstance(part, ast.Constant)
-+            and isinstance(part.value, str)
-+            and part.value == "/tmp/anc.js"
-+            for part in ast.walk(node.args[0])
++        if not message.get("_empty_recovery_synthetic"):
++            continue
++        content = message.get("content")
++        if not isinstance(content, str):
++            return False
++        message["content"] = cache_safe_recovery_nudge(
++            agent, content, attempt
 +        )
-+        if not has_anc:
-+            continue
-+        timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
-+        if (
-+            isinstance(timeout, ast.Constant)
-+            and isinstance(timeout.value, (int, float))
-+            and not isinstance(timeout.value, bool)
-+            and timeout.value > 0
-+        ):
-+            return (
-+                f"Fixed timeout={timeout.value:g}s on /tmp/anc.js is blocked because "
-+                "it can terminate healthy work before Hermes' execute_code deadline. "
-+                "Omit the nested timeout and rely on execute_code's outer budget."
-+            )
-+    return None
++        message["_openrouter_fresh_recovery"] = int(attempt)
++        return True
++    return False
 +
-+
- def generate_hermes_tools_module(enabled_tools: List[str],
-                                  transport: str = "uds") -> str:
-     """
-@@ -1286,6 +1342,10 @@ def execute_code(
-             "terminal(command=...) instead."
-         )
  
-+    fixed_timeout_hint = _fixed_anc_node_timeout_hint(code)
-+    if fixed_timeout_hint:
-+        return tool_error(fixed_timeout_hint)
-+
-     # Dispatch: remote backends use file-based RPC, local uses UDS
-     from tools.terminal_tool import _get_env_config, _docker_has_host_access
-     _env_config = _get_env_config()
+ @dataclass(frozen=True)
+ class EmptyAttempt:
 diff --git a/agent/frontier_harness.py b/agent/frontier_harness.py
 new file mode 100644
-index 00000000000..da01c2f1e43
+index 0000000000..5736d62f3d
 --- /dev/null
 +++ b/agent/frontier_harness.py
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,486 @@
 +"""Frontier-style execution policy for tool-using local models.
 +
 +This module is deliberately a control plane, not another agent loop.  It
@@ -918,16 +416,20 @@ index 00000000000..da01c2f1e43
 +
 +{_PROTOCOL_MARKER}
 +Use a bounded, evidence-driven execution loop:
-+1. Classify the task and localize the smallest relevant file/symbol set before editing. Prefer concise search results and read windows of at most 120 lines; treat empty output as explicit evidence, not a reason to repeat the same call.
++1. Classify the task from the user's latest prose first. Host boilerplate such as "Examine it with the vision_analyze tool" is not a user instruction. For README, banner, descriptor, docs, or copy-file work, skip localization and write those files. For code changes, localize the smallest relevant file/symbol set before editing. Prefer concise search results and read windows of at most 120 lines; treat empty output as explicit evidence, not a reason to repeat the same call.
 +2. Maintain one active task contract and one active phase: localize, plan, execute, verify, repair, or handoff. Preserve durable commitments in the todo/StateM artifacts and keep only the latest five useful tool-result pairs active; summarize older evidence.
 +3. Before every tool call, validate the tool name and required argument shape. Batch independent read-only calls. Never repeat an unchanged failed or no-progress call.
 +4. Mutations are checkpoint-backed. After a failed verification, diagnose once, then change the strategy or roll back the affected attempt; do not stack speculative edits.
-+5. Completion requires fresh deterministic evidence appropriate to the change. Inspect generated artifacts directly. If verification is unavailable, report the concrete blocker and do not claim success.
++5. Completion requires evidence that matches the change. Inspect generated artifacts directly. README, banner, descriptor, docs, and copy-file tasks complete when those files are written — do not search the home directory, clone, or run pytest/ruff/mypy unless the user asked for tests or executable code changed. If verification is unavailable for a code change, report the concrete blocker and do not claim success.
 +6. Candidate search is exceptional and bounded: after ambiguity or two failed repair boundaries, use at most two isolated candidates when delegation is available, choose with explicit tests/evidence, and merge only the winner.
 +7. Stop immediately on user pause/cancel/redirect. On iteration pressure or interruption, persist a concise handoff containing objective, completed work, current phase, evidence, blockers, and exact next action.
 +8. Missing operator information is a hard interaction boundary. Ask one focused question as the final response and stop. Never select a default, read a protected approval source, or continue because the operator is unavailable or the session is one-shot.
 +9. Treat mutations as non-atomic effects: use the supplied effect identity, verify before retry after timeout/interruption, and never replay an effect whose outcome is unknown.
 +10. If the live phase packet reports path drift or a repair boundary, stop issuing tools, inspect the last failure, change strategy once, and require fresh verification before continuing.
++11. The user's latest prose is the task contract. Host boilerplate such as "Examine it with the vision_analyze tool" is not a user instruction. SVG and other source/asset attachments are copied with write_file; do not describe them.
++12. Verification must match the change. README, banner, descriptor, docs, and copy-file tasks complete when those files are written. Do not search the home directory, clone, or run pytest/ruff/mypy unless the user asked for tests or the edited files are executable code.
++13. If the user's latest prose is a ping or status ask ("are you there", "where are we", "share an update"), answer in text immediately with zero tool calls. Do not poll, SSH, or execute_code instead of replying.
++14. Codex turn rule: a turn is incomplete until you emit a user-visible assistant message. Hidden reasoning is not a reply. After tools, write one short status sentence before the next tool batch. Do not retry a memory replace/remove or patch whose anchor (old_text/old_string) was not found; read current state and change the anchor, or skip that write and continue the user's task. When tools are omitted mid-turn (commentary gate), the text you write is status commentary — the turn continues and tools return on the next call; do not treat that sentence as the final answer.
 +Do not expose hidden chain-of-thought. Surface concise phase, action, evidence, and blocker summaries instead.
 +""".rstrip()
 +
@@ -1067,6 +569,10 @@ index 00000000000..da01c2f1e43
 +        exit_code = parsed.get("exit_code", parsed.get("returncode"))
 +        if isinstance(exit_code, int) and exit_code != 0:
 +            return True
++        if isinstance(exit_code, int) and exit_code == 0 and not parsed.get("error"):
++            # Successful terminal output can quote the word "error" (source
++            # dumps, compiler headers). That is not a failed tool call.
++            return False
 +        if parsed.get("error") and not parsed.get("success"):
 +            return True
 +    text = _content_text(content)
@@ -1298,7 +804,6 @@ index 00000000000..da01c2f1e43
 +            "trailing_failure_streak": state.get("trailing_failure_streak"),
 +            "next_action": state.get("next_action"),
 +            "progress_digest": state.get("progress_digest"),
-+            "next_action": "reconcile unknown effects, otherwise continue the current phase without replaying stale calls",
 +        },
 +    }
 +    directory.mkdir(parents=True, exist_ok=True)
@@ -1367,7 +872,7 @@ index 00000000000..da01c2f1e43
 +__all__ = ["apply_frontier_request_policy"]
 diff --git a/agent/statem_runtime.py b/agent/statem_runtime.py
 new file mode 100644
-index 00000000000..d57dfedbfe2
+index 0000000000..e4412045c7
 --- /dev/null
 +++ b/agent/statem_runtime.py
 @@ -0,0 +1,495 @@
@@ -1567,13 +1072,13 @@ index 00000000000..d57dfedbfe2
 +    completion without adding work to the model path.
 +    """
 +
++    # Prefill/think gaps stay pulse+timer only. Do not name a "provider"
++    # on a local engine — that reads as a cloud hang. Keep tool and
++    # compaction labels; they explain a real pause.
 +    _VISIBLE_PHASES = {
-+        "turn_started": "Frontier: turn started",
-+        "provider_wait": "Frontier: waiting for provider",
 +        "tool_execution": "Frontier: executing tools",
 +        "compaction": "Frontier: compacting context",
 +        "interrupted": "Frontier: turn interrupted",
-+        "terminal": "Frontier: turn finished",
 +    }
 +
 +    def __init__(self, agent: Any, turn_id: str, generation: int) -> None:
@@ -1868,7 +1373,7 @@ index 00000000000..d57dfedbfe2
 +    return bool(record and (record.get("status") == "paused" or record.get("cancel_requested")))
 diff --git a/agent/tool_argument_normalization.py b/agent/tool_argument_normalization.py
 new file mode 100644
-index 00000000000..f51e7051d89
+index 0000000000..f51e7051d8
 --- /dev/null
 +++ b/agent/tool_argument_normalization.py
 @@ -0,0 +1,77 @@
@@ -1949,9 +1454,1975 @@ index 00000000000..f51e7051d89
 +    """Backward-compatible wrapper for callers that do not know the tool name."""
 +
 +    return normalize_tool_arguments(None, value, max_depth=max_depth)
-diff --git a/tools/frontier_harness_audit.py b/tools/frontier_harness_audit.py
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index 518b714f1b..357f7ed200 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -144,13 +144,19 @@ class _BatchAbandoned(BaseException):
+     so ``except Exception`` handlers in the middleware chain can't swallow it."""
+ 
+ 
+-def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
+-    """Parse model-emitted arguments without repairing or coercing them."""
++def _parse_tool_arguments(
++    raw_arguments: Any,
++    tool_name: str | None = None,
++) -> tuple[dict, Optional[str]]:
++    """Parse model-emitted arguments and remove transport-envelope nesting."""
+     try:
+         arguments = json.loads(raw_arguments)
+     except (json.JSONDecodeError, TypeError):
+         arguments = None
+     if isinstance(arguments, dict):
++        from agent.tool_argument_normalization import normalize_tool_arguments
++
++        arguments, _ = normalize_tool_arguments(tool_name, arguments)
+         return arguments, None
+     return {}, json.dumps(
+         {"error": "Invalid tool arguments", "message": "Tool arguments must be a valid JSON object; tool was not executed."},
+@@ -277,6 +283,17 @@ class _ToolCallRef:
+             middleware_trace=list(self.trace if trace is None else trace),
+             **outcome,
+         )
++        try:
++            from agent.statem_runtime import record_tool_result
++            record_tool_result(
++                agent, self.name, self.args, result,
++                status=outcome.get("status"),
++                error_type=outcome.get("error_type"),
++                error_message=outcome.get("error_message"),
++                duration_ms=outcome.get("duration_ms"),
++            )
++        except Exception:
++            pass
+ 
+     def emit_cancelled(self, agent, start_time: float) -> str:
+         """Synthesize the ``cancelled`` result for a KeyboardInterrupt mid-tool and emit its hook."""
+@@ -431,7 +448,7 @@ class _ParsedCall:
+ 
+ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
+     name = _canonical_tool_name(tool_call.function.name)
+-    args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
++    args, parse_error = _parse_tool_arguments(tool_call.function.arguments, name)
+     scope_block = None
+     if parse_error is None:
+         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+@@ -780,6 +797,36 @@ def _resolve_sequential_tool_timeout() -> float | None:
+     return resolve_timeout("tools.sequential_call", default=_resolve_concurrent_tool_timeout())
+ 
+ 
++def _resolve_registered_tool_timeout(
++    function_name: str,
++    function_args: dict[str, Any],
++    default: float | None,
++) -> float | None:
++    """Apply a registered tool's task-scoped deadline, if one exists.
++
++    Long-running plugin tools must not force every ordinary tool to inherit
++    their deadline. Metadata remains host-owned and is clamped through the
++    shared deadline policy before it reaches a platform wait primitive.
++    """
++    try:
++        from agent.deadline import clamp_timeout
++        from tools.registry import registry
++
++        entry = registry.get_entry(function_name)
++        configured = getattr(entry, "execution_timeout_seconds", None)
++        if configured is None:
++            return default
++        value = configured(function_args) if callable(configured) else configured
++        return clamp_timeout(value)
++    except Exception:
++        logger.warning(
++            "registered timeout resolver failed for %s; using generic deadline",
++            function_name,
++            exc_info=True,
++        )
++        return default
++
++
+ # Tools whose call blocks on a long-running operation that supervises its own liveness: no generic
+ # sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by design
+ # (children carry heartbeats, the stale monitor, and ``delegation.child_timeout_seconds``); under the
+@@ -835,7 +882,9 @@ def _run_sequential_tool_execution_middleware(
+     """Run one sequential call on a worker thread under the concurrent executor's deadline.
+     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
+     generic deadline would report ``tool_timeout`` while the prompt is still live."""
+-    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
++    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_registered_tool_timeout(
++        function_name, function_args, _resolve_sequential_tool_timeout()
++    )
+     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
+     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+     if function_name in _NEVER_PARALLEL_TOOLS:
+diff --git a/agent/tool_guardrails.py b/agent/tool_guardrails.py
+index 7a01869ca2..2e10f78fda 100644
+--- a/agent/tool_guardrails.py
++++ b/agent/tool_guardrails.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import re
+ from dataclasses import asdict, dataclass, field, fields
+ from typing import Any, Mapping
+ 
+@@ -16,6 +17,58 @@ from utils import safe_json_loads
+ from agent.tool_result_classification import file_mutation_result_landed
+ 
+ 
++# User messages that require a text reply instead of more tools.
++_PING_RE = re.compile(
++    r"^\s*(?:(?:so+rry|sorry|hey|hi|hello)[,.\s!]*)*"
++    r"(?:are you (?:still )?there|you there|still there|"
++    r"are you stuck|you stuck|still stuck|"
++    r"are you looping|is this looping)\s*[?.!]?\s*$",
++    re.I,
++)
++_STATUS_ASK_RE = re.compile(
++    r"(?:"
++    r"\bwhere are we(?:\s+at)?(?:\s+so far)?\b"
++    r"|\b(?:please\s+)?share an update\b"
++    r"|\bany (?:update|progress|news)\b"
++    r"|\bwhat(?:'s|s| is) going on\b"
++    r"|\bwhat(?:'s|s| is) the (?:status|update)\b"
++    r"|\b(?:status|progress) update\b"
++    r"|\bupdate please\b"
++    r"|\bare you stuck\b"
++    r"|\bdid you get stuck\b"
++    r"|\bis this looping\b"
++    r")",
++    re.I,
++)
++_CONTINUE_RE = re.compile(
++    r"\b(?:continue|keep going|keep working|proceed|carry on|resume|go ahead)\b",
++    re.I,
++)
++
++
++def classify_user_goal_kind(text: str) -> str:
++    """Classify the latest user prose for the tool-only brake.
++
++    Returns ``ping``, ``status``, or ``work``. Pings must be answered with
++    zero tools. Status asks get at most one tool round. Ordinary work is
++    nudged after ``max_tool_only_iterations`` mute rounds, then hard-stopped
++    after ``work_tool_only_halt_after`` so a thinking-model tool streak cannot
++    freeze the Desktop chat. Hidden chain-of-thought is not a user-visible
++    reply — matching the Codex harness, which ends a turn only on an
++    assistant message, not on reasoning items.
++    """
++    stripped = (text or "").strip()
++    if not stripped or len(stripped) > 400:
++        return "work"
++    if _PING_RE.match(stripped):
++        return "ping"
++    if _STATUS_ASK_RE.search(stripped):
++        return "status"
++    if _CONTINUE_RE.search(stripped):
++        return "work"
++    return "work"
++
++
+ IDEMPOTENT_TOOL_NAMES = frozenset({
+     "read_file", "search_files", "web_search", "web_extract", "session_search", "skill_view", "skills_list",
+     "browser_snapshot", "browser_console", "browser_get_images", "mcp_filesystem_read_file",
+@@ -30,6 +83,17 @@ MUTATING_TOOL_NAMES = frozenset({
+     "send_message", "cronjob_manage", "delegate_task", "process_manage",
+ })
+ 
++# Post-response bookkeeping: a mute round made only of these is not productive Codex work.
++HOUSEKEEPING_TOOL_NAMES = frozenset({
++    "memory", "todo_list", "skill_manage", "session_search",
++})
++
++# Codex apply_patch / Hermes memory+patch: an unchanged failed anchor is not a new experiment.
++_STALE_ANCHOR_PATTERNS = {
++    "memory": re.compile(r"no entry matched|multiple entries matched", re.I),
++    "patch": re.compile(r"old_string not found", re.I),
++}
++
+ # Pollers: legitimately re-invoked with identical args; the identical-call NOTICE never fires.
+ STALL_GUARD_REPEATABLE_TOOLS = frozenset({"process_manage"})
+ _STALL_GUARD_REPEATABLE_SUFFIXES = ("_get_result", "_poll")  # generated / MCP poller conventions
+@@ -80,6 +144,16 @@ def is_stall_guard_repeatable(tool_name: str) -> bool:
+     return tool_name in STALL_GUARD_REPEATABLE_TOOLS or tool_name.endswith(_STALL_GUARD_REPEATABLE_SUFFIXES)
+ 
+ 
++def is_stale_anchor_failure(tool_name: str, result: str | None) -> bool:
++    """True when memory/patch failed because the edit anchor is gone or ambiguous.
++
++    Codex apply_patch treats a context mismatch as "do not retry the same hunk";
++    Hermes memory replace/remove and patch old_string have the same shape.
++    """
++    pattern = _STALE_ANCHOR_PATTERNS.get(tool_name)
++    return bool(pattern and result and pattern.search(result))
++
++
+ def _is_non_interactive_platform(platform: str | None) -> bool:
+     """True for gateway/cron sessions where tool loops are unattended."""
+     if not isinstance(platform, str) or not platform.strip():
+@@ -117,6 +191,20 @@ class ToolCallGuardrailConfig:
+     same_tool_failure_halt_after: int = 8
+     no_progress_warn_after: int = 2
+     no_progress_block_after: int = 5
++    cross_turn_identical_block_after: int = 3
++    max_tool_only_iterations: int = 8
++    work_tool_only_halt_after: int = 16
++    status_ask_max_tool_only: int = 1
++    ping_max_tool_only: int = 0
++    housekeeping_tool_only_halt_after: int = 2
++    # Codex commentary gate: after N mute tool rounds, the next API call omits
++    # tools so the model must emit a user-visible status sentence, then tools
++    # are restored and the turn continues. ``0`` disables the gate (halt-only).
++    commentary_gate_after: int = 2
++    # After this many empty tools-off commentary attempts, restore tools
++    # rather than looping tools-off empties until empty-response exhaustion.
++    commentary_gate_empty_cap: int = 2
++    stale_anchor_block_after: int = 1
+     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
+     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
+     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
+@@ -139,7 +227,38 @@ class ToolCallGuardrailConfig:
+             return _int_at_least(nested, getattr(d, name), 1)
+ 
+         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
+-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
++        return cls(
++            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
++            max_tool_only_iterations=_int_at_least(
++                data.get("max_tool_only_iterations"), d.max_tool_only_iterations, 0
++            ),
++            work_tool_only_halt_after=_int_at_least(
++                data.get("work_tool_only_halt_after"), d.work_tool_only_halt_after, 0
++            ),
++            status_ask_max_tool_only=_int_at_least(
++                data.get("status_ask_max_tool_only"), d.status_ask_max_tool_only, 0
++            ),
++            ping_max_tool_only=_int_at_least(
++                data.get("ping_max_tool_only"), d.ping_max_tool_only, 0
++            ),
++            housekeeping_tool_only_halt_after=_int_at_least(
++                data.get("housekeeping_tool_only_halt_after"), d.housekeeping_tool_only_halt_after, 0
++            ),
++            commentary_gate_after=_int_at_least(
++                data.get("commentary_gate_after"), d.commentary_gate_after, 0
++            ),
++            commentary_gate_empty_cap=_int_at_least(
++                data.get("commentary_gate_empty_cap"), d.commentary_gate_empty_cap, 1
++            ),
++            stale_anchor_block_after=_int_at_least(
++                data.get("stale_anchor_block_after"), d.stale_anchor_block_after, 0
++            ),
++            cross_turn_identical_block_after=_int_at_least(
++                data.get("cross_turn_identical_block_after"), d.cross_turn_identical_block_after, 1
++            ),
++            **flags,
++            **thresholds,
++        )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -216,8 +335,13 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
+ 
+     if tool_name == "memory":
+         data = safe_json_loads(result)
+-        if isinstance(data, dict) and data.get("success") is False and "exceed the limit" in data.get("error", ""):
+-            return True, " [full]"
++        if isinstance(data, dict) and data.get("success") is False:
++            err = str(data.get("error") or "")
++            if "exceed the limit" in err.lower():
++                return True, " [full]"
++            if is_stale_anchor_failure("memory", err):
++                return True, " [stale-anchor]"
++            return True, " [error]"
+     lower = result[:500].lower()
+     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
+ 
+@@ -257,6 +381,16 @@ _DECISION_MESSAGES: dict[str, str] = {
+         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
+         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
+     ),
++    "stale_anchor_retry_block": (
++        "Blocked {tool_name}: the edit anchor (old_text/old_string) was not found or was "
++        "ambiguous. Do not retry the same anchor. Read the current file or current_entries, "
++        "pick a unique substring that exists now, or skip this write and continue the user's task."
++    ),
++    "stale_anchor_retry_warning": (
++        "{tool_name} failed because the edit anchor was missing or ambiguous. "
++        "Do not retry the same old_text/old_string. Read current state and change the anchor, "
++        "or skip this write and continue the work."
++    ),
+ }
+ 
+ _IDENTICAL_CALL_NOTICE = (
+@@ -302,11 +436,244 @@ class ToolCallGuardrailController:
+         self._persisted_result_paths: dict[str, str] = {}
+         self._turn_web_search_count = 0
+         self._turn_subagent_count = 0
++        self._tool_only_streak = 0
++        self._housekeeping_only_streak = 0
++        self._force_text_reply = False
++        self._force_text_reason = ""
++        self._work_nudge_pending = False
++        self._work_nudge_emitted_at = 0
++        self._user_goal_kind = "work"
++        self._brake_notice_emitted = False
++        # Armed after mute rounds; active while the tools-off request is in flight.
++        self._commentary_gate_armed = False
++        self._commentary_gate_active = False
++        self._commentary_gate_empty_count = 0
++        self._recovery_block_counts: dict[ToolCallSignature, int] = {}
++        self._stale_anchor_counts: dict[ToolCallSignature, int] = {}
+ 
+     @property
+     def halt_decision(self) -> ToolGuardrailDecision | None:
+         return self._halt_decision
+ 
++    @property
++    def tool_only_streak(self) -> int:
++        return self._tool_only_streak
++
++    @property
++    def housekeeping_only_streak(self) -> int:
++        return self._housekeeping_only_streak
++
++    def _tool_only_cap(self) -> int:
++        if self._user_goal_kind == "ping":
++            return self.config.ping_max_tool_only
++        if self._user_goal_kind == "status":
++            return self.config.status_ask_max_tool_only
++        return self.config.max_tool_only_iterations
++
++    def observe_user_goal(self, text: str) -> None:
++        """Classify the user turn and arm the ping brake before the first tool."""
++        kind = classify_user_goal_kind(text)
++        self._user_goal_kind = kind
++        if kind == "ping" and self.config.ping_max_tool_only == 0:
++            self._force_text_reply = True
++            self._force_text_reason = "ping"
++
++    def observe_assistant_round(
++        self,
++        *,
++        has_tool_calls: bool,
++        has_visible_text: bool,
++        has_reasoning: bool = False,
++        housekeeping_only: bool = False,
++    ) -> None:
++        """Count consecutive tool-only assistant rounds in this turn.
++
++        ``has_reasoning`` is accepted for call-site compatibility but is not
++        user-visible progress. Codex's harness ends a turn only when the model
++        emits an assistant message; reasoning items keep the tool loop going.
++        GLM-max always streams CoT, so treating reasoning as a reply would
++        disable the mute-loop brake on the models that need it most.
++
++        ``housekeeping_only`` is a Codex-shaped tighter cap: memory/todo/skill
++        mute rounds are not productive work and must not ride the long work
++        mute budget.
++        """
++        del has_reasoning
++        if has_visible_text:
++            self._tool_only_streak = 0
++            self._housekeeping_only_streak = 0
++            self._work_nudge_emitted_at = 0
++            self._commentary_gate_armed = False
++            self._commentary_gate_empty_count = 0
++            if self._user_goal_kind == "work":
++                self._force_text_reply = False
++                self._force_text_reason = ""
++            return
++        if not has_tool_calls:
++            return
++        self._tool_only_streak += 1
++        if housekeeping_only:
++            self._housekeeping_only_streak += 1
++        else:
++            self._housekeeping_only_streak = 0
++        cap = self._tool_only_cap()
++        if self._user_goal_kind in {"ping", "status"}:
++            if cap == 0 or self._tool_only_streak >= cap:
++                self._force_text_reply = True
++                self._force_text_reason = self._user_goal_kind
++            return
++        housekeeping_halt = self.config.housekeeping_tool_only_halt_after
++        if housekeeping_only and housekeeping_halt > 0 and self._housekeeping_only_streak >= housekeeping_halt:
++            self._force_text_reply = True
++            self._force_text_reason = "housekeeping"
++            self._commentary_gate_armed = False
++            return
++        halt_after = self.config.work_tool_only_halt_after
++        if halt_after > 0 and self._tool_only_streak >= halt_after:
++            self._force_text_reply = True
++            self._force_text_reason = "mute"
++            self._commentary_gate_armed = False
++            return
++        gate_after = self.config.commentary_gate_after
++        if gate_after > 0 and self._tool_only_streak % gate_after == 0:
++            # Codex: mute tool-only is not a legal mid-turn state. Arm a tools-off
++            # commentary request instead of letting the mute streak grow.
++            self._commentary_gate_armed = True
++        if cap > 0 and self._tool_only_streak >= cap:
++            nudge_round = self._tool_only_streak // cap
++            if nudge_round > self._work_nudge_emitted_at:
++                self._work_nudge_pending = True
++                self._work_nudge_emitted_at = nudge_round
++
++    def begin_commentary_request(self) -> bool:
++        """If the commentary gate is armed, mark this API call tools-off and return True."""
++        if self._force_text_reply or not self._commentary_gate_armed:
++            return False
++        if self._user_goal_kind != "work":
++            return False
++        self._commentary_gate_active = True
++        self._commentary_gate_armed = False
++        return True
++
++    def commentary_gate_active(self) -> bool:
++        """True while the in-flight API call had tools omitted for commentary."""
++        return self._commentary_gate_active
++
++    def finish_commentary_request(self, *, has_visible_text: bool) -> bool:
++        """Complete a tools-off commentary call. Returns True when the turn must continue.
++
++        Visible commentary resets the mute streak (Codex: progress speech is not
++        ``final_answer``). Empty commentary re-arms the gate so the next attempt
++        still omits tools, until ``commentary_gate_empty_cap`` empties restore
++        tools rather than looping tools-off forever.
++        """
++        if not self._commentary_gate_active:
++            return False
++        self._commentary_gate_active = False
++        if has_visible_text:
++            self._tool_only_streak = 0
++            self._housekeeping_only_streak = 0
++            self._work_nudge_emitted_at = 0
++            self._work_nudge_pending = False
++            self._commentary_gate_armed = False
++            self._commentary_gate_empty_count = 0
++            return True
++        # Empty / think-only: keep the mute count and force another tools-off call.
++        self._commentary_gate_empty_count += 1
++        empty_cap = self.config.commentary_gate_empty_cap
++        if empty_cap > 0 and self._commentary_gate_empty_count >= empty_cap:
++            self._commentary_gate_armed = False
++            self._commentary_gate_empty_count = 0
++            return False
++        self._commentary_gate_armed = True
++        return True
++
++    def consume_tool_only_brake_notice(self) -> str | None:
++        """Nudge appended to the last tool result before the next API call."""
++        if self._force_text_reply and not self._brake_notice_emitted:
++            if self._user_goal_kind != "work" or self._tool_only_streak >= 1:
++                self._work_nudge_pending = False
++                self._brake_notice_emitted = True
++                return (
++                    "[TOOL LOOP BRAKE] Codex turn rule: stop calling tools. Reply to "
++                    "the user in plain text now. A turn ends only on a user-visible "
++                    "assistant message — hidden reasoning and more tools do not count. "
++                    "The next tool call will be blocked and this turn will end."
++                )
++        if self._commentary_gate_armed and not self._force_text_reply:
++            self._work_nudge_pending = False
++            return (
++                "[COMMENTARY GATE] Codex mid-turn rule: tools are suspended for the "
++                "next model call. Write one short status sentence for the user. That "
++                "sentence is commentary — the turn continues and tools are restored "
++                "after it. Hidden reasoning does not count."
++            )
++        if self._work_nudge_pending:
++            self._work_nudge_pending = False
++            remaining = max(
++                0,
++                self.config.work_tool_only_halt_after - self._tool_only_streak,
++            )
++            halt_hint = (
++                f" After {remaining} more mute tool rounds this turn will halt."
++                if remaining
++                else " The next mute tool round will halt this turn."
++            )
++            return (
++                "[TOOL LOOP NUDGE] Codex commentary required: write one short status "
++                "sentence to the user, then continue the work. Hidden reasoning does "
++                f"not count as a reply.{halt_hint} Tools remain allowed until the halt."
++            )
++        return None
++
++    def tool_only_halt_message(self) -> str:
++        if self._force_text_reason == "ping" or self._user_goal_kind == "ping":
++            return (
++                "I am here. I stopped a tool loop so I could answer you instead "
++                "of calling another tool. Send another message if you want me "
++                "to continue the work."
++            )
++        if self._force_text_reason == "status" or self._user_goal_kind == "status":
++            return (
++                "Stopping to answer you: I was still running tools instead of "
++                "reporting status. Send another message if you want me to "
++                "continue from the last tool result."
++            )
++        if self._force_text_reason == "housekeeping":
++            return (
++                f"Stopped after {self._housekeeping_only_streak} consecutive "
++                "housekeeping-only tool rounds (memory/todo) with no user-visible "
++                "reply. Codex requires an assistant message to finish a turn — "
++                "not more memory or todo calls. Send another message to continue."
++            )
++        return (
++            f"Stopped after {self._tool_only_streak} consecutive tool-only "
++            "rounds with no reply. Codex requires a user-visible assistant "
++            "message before more tools. Send another message to continue."
++        )
++
++    def _recoverable_block(self, decision: ToolGuardrailDecision) -> ToolGuardrailDecision:
++        signature = decision.signature
++        if signature is None:
++            return decision
++        count = self._recovery_block_counts.get(signature, 0) + 1
++        self._recovery_block_counts[signature] = count
++        if count < 2:
++            return decision
++        halted = ToolGuardrailDecision(
++            action="halt",
++            code=f"{decision.code}_repeated",
++            message=(
++                f"{decision.message} The model attempted to cross the same guardrail again; "
++                "execution is ending with a retained-state handoff."
++            ),
++            tool_name=decision.tool_name,
++            count=count,
++            signature=signature,
++        )
++        self._halt_decision = halted
++        return halted
++
+     def _decide(
+         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
+         *, message: str | None = None, **fmt: Any,
+@@ -323,6 +690,24 @@ class ToolCallGuardrailController:
+         args = _coerce_args(args)
+         signature = ToolCallSignature.from_call(tool_name, args)
+         allow = ToolGuardrailDecision(tool_name=tool_name, signature=signature)
++        if self._force_text_reply:
++            return self._recoverable_block(ToolGuardrailDecision(
++                action="block",
++                code="tool_only_reply_required_block",
++                message=self.tool_only_halt_message(),
++                tool_name=tool_name,
++                count=max(self._tool_only_streak, 1),
++                signature=signature,
++            ))
++
++        stale_count = self._stale_anchor_counts.get(signature, 0)
++        if (
++            self.config.stale_anchor_block_after > 0
++            and stale_count >= self.config.stale_anchor_block_after
++        ):
++            return self._recoverable_block(self._decide(
++                "block", "stale_anchor_retry_block", tool_name, stale_count, signature,
++            ))
+ 
+         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
+         cap_block = self._check_loop_cap(tool_name, args, signature)
+@@ -345,6 +730,8 @@ class ToolCallGuardrailController:
+         signature = ToolCallSignature.from_call(tool_name, args)
+         if failed is None:
+             failed, _ = classify_tool_failure(tool_name, result)
++        if not failed and is_stale_anchor_failure(tool_name, result):
++            failed = True
+         warnings = self.config.warnings_enabled
+ 
+         if failed:
+@@ -352,9 +739,22 @@ class ToolCallGuardrailController:
+             # a mutation since the last identical failure restarts the exact-args streak.
+             if self._progress_since_failure.pop(signature, False):
+                 self._exact_failure_counts.pop(signature, None)
++                self._stale_anchor_counts.pop(signature, None)
+             exact_count = self._exact_failure_counts[signature] = self._exact_failure_counts.get(signature, 0) + 1
+             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
+             self._no_progress.pop(signature, None)
++            stale = is_stale_anchor_failure(tool_name, result)
++            if stale:
++                stale_count = self._stale_anchor_counts[signature] = (
++                    self._stale_anchor_counts.get(signature, 0) + 1
++                )
++                if warnings:
++                    return self._decide(
++                        "warn", "stale_anchor_retry_warning", tool_name, stale_count, signature,
++                    )
++                return ToolGuardrailDecision(
++                    tool_name=tool_name, count=stale_count, signature=signature,
++                )
+             # same_tool_failure counts DIFFERENT args on one tool; for failure-tolerant
+             # tools a run of distinct red commands is diagnosis, not a loop — warn, never halt.
+             if (
+@@ -380,6 +780,7 @@ class ToolCallGuardrailController:
+ 
+         self._exact_failure_counts.pop(signature, None)
+         self._same_tool_failure_counts.pop(tool_name, None)
++        self._stale_anchor_counts.pop(signature, None)
+         # A successful mutation is progress for every failing signature still counted
+         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
+         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
+@@ -483,6 +884,19 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
+     return json.dumps({"error": decision.message, "guardrail": decision.to_metadata()}, ensure_ascii=False)
+ 
+ 
++def controlled_halt_response(decision: ToolGuardrailDecision) -> str:
++    """User-visible halt copy. Mute-turn and stale-anchor brakes are not retry loops."""
++    code = decision.code or ""
++    if code.startswith("tool_only_reply_required") or code.startswith("stale_anchor"):
++        return decision.message
++    return (
++        f"I stopped retrying {decision.tool_name or 'a tool'} because it hit the tool-call guardrail "
++        f"({code}) after {decision.count} repeated non-progressing "
++        "attempts. The last tool result explains the blocker; the next step is "
++        "to change strategy instead of repeating the same call."
++    )
++
++
+ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
+     """Append runtime guidance to the current tool result content."""
+     if decision.action not in {"warn", "halt"} or not decision.message:
+diff --git a/agent/transports/chat_completions.py b/agent/transports/chat_completions.py
+index 456164fd15..5c8e9aaf6f 100644
+--- a/agent/transports/chat_completions.py
++++ b/agent/transports/chat_completions.py
+@@ -9,6 +9,7 @@ from typing import Any
+ from urllib.parse import urlparse
+ 
+ from agent.lmstudio_reasoning import resolve_lmstudio_effort
++from agent.frontier_harness import apply_frontier_request_policy
+ from agent.reasoning_effort import (
+     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
+     kimi_supported_efforts, requested_effort,
+@@ -30,6 +31,39 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
+ # reserved-name class (#83122) so the two transports stay consistent.
+ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
+ 
++
++def _apply_glm53_vllm_reasoning_kwargs(
++    api_kwargs: dict[str, Any],
++    *,
++    model: str,
++    reasoning_config: dict | None,
++) -> None:
++    """Send Spark/vLLM GLM-5.3 reasoning through chat_template_kwargs.
++
++    Custom (non-OpenRouter) routes skip extra_body.reasoning, so the GLM
++    jinja template defaults reasoning_effort to max and every tiny tool
++    call thinks for minutes. The live Spark template only honors ``low``
++    and ``high``; any other value (including ``medium``) becomes max.
++    """
++    model_l = (model or "").lower()
++    if "glm-5.3" not in model_l and "glm53" not in model_l:
++        return
++    effort = requested_effort(reasoning_config)
++    if not effort:
++        return
++    if effort == "medium":
++        effort = "high"
++    extra = api_kwargs.get("extra_body")
++    if not isinstance(extra, dict):
++        extra = {}
++        api_kwargs["extra_body"] = extra
++    ctk = extra.get("chat_template_kwargs")
++    if not isinstance(ctk, dict):
++        ctk = {}
++        extra["chat_template_kwargs"] = ctk
++    ctk.setdefault("enable_thinking", True)
++    ctk["reasoning_effort"] = effort
++
+ # Persistence-only / cross-transport message keys that strict OpenAI-compatible
+ # providers reject with HTTP 400 ("Extra inputs are not permitted").
+ _STRIP_MSG_KEYS = (
+@@ -285,7 +319,17 @@ def _base_kwargs(model: str, sanitized: list, tools: Any, params: dict, profile:
+ 
+ 
+ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *, supports_prompt_cache_key: bool) -> dict[str, Any]:
+-    """Tail shared by both build paths: content-addressed prompt_cache_key, then return."""
++    """Tail shared by both build paths: frontier policy, GLM reasoning, then prompt_cache_key."""
++    apply_frontier_request_policy(
++        api_kwargs,
++        model=params.get("model") or api_kwargs.get("model") or "",
++        params=params,
++    )
++    _apply_glm53_vllm_reasoning_kwargs(
++        api_kwargs,
++        model=str(params.get("model") or api_kwargs.get("model") or ""),
++        reasoning_config=params.get("reasoning_config"),
++    )
+     _add_prompt_cache_key(
+         api_kwargs, messages=sanitized, tools=api_kwargs.get("tools"), supports_prompt_cache_key=supports_prompt_cache_key,
+         session_id=params.get("session_id"), cache_scope_id=params.get("cache_scope_id"),
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 4907d6b09b..0f72779982 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -79,6 +79,15 @@ def finish_text_response(
+ 
+     # Think-block-only / empty content: recovery path.
+     if not agent._has_content_after_think_block(final_response):
++        # Commentary-gate call returned empty: re-arm tools-off for the retry and
++        # do not treat this as a normal final-text miss.
++        try:
++            _guardrails = getattr(agent, "_tool_guardrails", None)
++            _finish_gate = getattr(_guardrails, "finish_commentary_request", None)
++            if callable(_finish_gate):
++                _finish_gate(has_visible_text=False)
++        except Exception:
++            logger.debug("Commentary gate empty-response re-arm failed", exc_info=True)
+         _ev = recover_empty_response(
+             agent, assistant_message, response, finish_reason, final_response=final_response,
+             messages=messages, api_messages=api_messages, conversation_history=conversation_history,
+@@ -103,6 +112,27 @@ def finish_text_response(
+     agent._emit_pending_fallback_notice()
+     agent._clear_status_buffer()
+ 
++    # Codex commentary gate: tools were omitted so this text is mid-turn status, not
++    # final_answer. Stream it, reset the mute streak, restore tools on the next call.
++    try:
++        _guardrails = getattr(agent, "_tool_guardrails", None)
++        _finish_gate = getattr(_guardrails, "finish_commentary_request", None)
++        _visible_for_gate = agent._strip_think_blocks(final_response or "").strip()
++        if callable(_finish_gate) and _finish_gate(has_visible_text=bool(_visible_for_gate)):
++            interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
++            append_message(messages, interim_msg)
++            agent._emit_interim_assistant_message(interim_msg)
++            agent._session_messages = messages
++            final_response = None
++            logger.info(
++                "Commentary gate: mid-turn status delivered; continuing with tools "
++                "(session=%s)",
++                getattr(agent, "session_id", None) or "none",
++            )
++            return _verdict("continue")
++    except Exception:
++        logger.debug("Commentary gate finish path failed", exc_info=True)
++
+     # Defensive: repair malformed role-alternation before API call. Catches cases where the history got
+     # wedged into a ``tool → user`` or ``user → user`` tail (e.g. after empty- response scaffolding was
+     # stripped and a new user message landed after an orphan tool result). Most providers return empty
+diff --git a/agent/turn_request_assembly.py b/agent/turn_request_assembly.py
+index 3595532097..343510ef1c 100644
+--- a/agent/turn_request_assembly.py
++++ b/agent/turn_request_assembly.py
+@@ -189,6 +189,25 @@ def assemble_api_request(
+     # the canonical tool registry stays undecorated. Marked ``content`` becomes text
+     # blocks the whitespace pass skips, so the same row's bytes vary across turns.
+     tools_for_api = agent.tools
++    try:
++        _guardrails = getattr(agent, "_tool_guardrails", None)
++        _begin_gate = getattr(_guardrails, "begin_commentary_request", None)
++        if callable(_begin_gate) and _begin_gate():
++            # Codex commentary gate: omit tools so the model can only emit visible text.
++            # Use [] not None: build_api_kwargs treats None as "default to agent.tools",
++            # which would restore the registry and make the gate a no-op. The chat
++            # completions transport skips a falsy tools list, so [] never becomes
++            # ``"tools": []`` on the wire (some OpenAI-compatible servers treat an
++            # empty array as "tools present").
++            tools_for_api = []
++            logger.info(
++                "Commentary gate: omitting tools for mid-turn status "
++                "(session=%s streak=%s)",
++                getattr(agent, "session_id", None) or "none",
++                getattr(_guardrails, "tool_only_streak", "?"),
++            )
++    except Exception:
++        logger.debug("Commentary gate tool omission failed", exc_info=True)
+     if agent._use_prompt_caching and agent.provider != "moa":
+         from agent.prompt_caching import envelope_tool_part_cache_markers_supported
+ 
+@@ -214,6 +233,13 @@ def assemble_api_request(
+         )
+         api_messages = _initial_cache_plan.messages
+         tools_for_api = _initial_cache_plan.tools
++        # Prompt-cache planning must not reintroduce tools on a commentary-gate call.
++        try:
++            _guardrails = getattr(agent, "_tool_guardrails", None)
++            if getattr(_guardrails, "commentary_gate_active", lambda: False)():
++                tools_for_api = []
++        except Exception:
++            logger.debug("Commentary gate post-cache tool strip failed", exc_info=True)
+ 
+     # Prepare the persistent-MoA request before measuring compression pressure: the
+     # ephemeral advisor output is absent from ``messages``; ``create()`` reuses the
+diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
+index daa009ac80..ca423795e1 100644
+--- a/agent/turn_tool_round.py
++++ b/agent/turn_tool_round.py
+@@ -17,10 +17,9 @@ from agent.message_sanitization import coalesce_tool_call_id
+ from agent.turn_preflight import compress_after_tool_results
+ from agent.turn_tool_validation import validate_tool_calls
+ 
+-logger = logging.getLogger("agent.conversation_loop")
++from agent.tool_guardrails import HOUSEKEEPING_TOOL_NAMES, controlled_halt_response
+ 
+-# Post-response housekeeping tools: a round made only of these mutes tool progress.
+-_HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
++logger = logging.getLogger("agent.conversation_loop")
+ 
+ 
+ @dataclass
+@@ -150,6 +149,43 @@ def run_tool_round(
+             agent.stream_delta_callback(None)
+ 
+     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
++    try:
++        _protocol = getattr(agent, "_frontier_protocol", None)
++        if _protocol is not None:
++            _protocol.transition("tool_execution", count=len(assistant_message.tool_calls))
++    except Exception:
++        logger.debug("Frontier tool-execution transition failed", exc_info=True)
++    try:
++        _guardrails = getattr(agent, "_tool_guardrails", None)
++        _observe_round = getattr(_guardrails, "observe_assistant_round", None)
++        if callable(_observe_round):
++            _raw_content = getattr(assistant_message, "content", None)
++            _visible = _raw_content.strip() if isinstance(_raw_content, str) else ""
++            _reasoning = getattr(assistant_message, "reasoning", None) or getattr(
++                assistant_message, "reasoning_content", None
++            )
++            if not isinstance(_reasoning, str):
++                _reasoning = ""
++            _names = {
++                getattr(getattr(tc, "function", None), "name", "")
++                for tc in assistant_message.tool_calls
++            }
++            _observe_round(
++                has_tool_calls=True,
++                has_visible_text=bool(_visible),
++                has_reasoning=bool(_reasoning.strip()),
++                housekeeping_only=bool(_names) and _names <= HOUSEKEEPING_TOOL_NAMES,
++            )
++        _brake_notice = getattr(_guardrails, "consume_tool_only_brake_notice", None)
++        if callable(_brake_notice):
++            _notice = _brake_notice()
++            if _notice:
++                for _tool_msg in reversed(messages):
++                    if isinstance(_tool_msg, dict) and _tool_msg.get("role") == "tool":
++                        _tool_msg["content"] = f"{_tool_msg.get('content') or ''}\n\n{_notice}"
++                        break
++    except Exception:
++        logger.debug("Tool-only brake observation failed", exc_info=True)
+ 
+     if getattr(agent, "_incremental_persistence_failed", False):
+         # Tool result could not be made canonical: never send the in-memory result to
+@@ -162,7 +198,7 @@ def run_tool_round(
+     if agent._tool_guardrail_halt_decision is not None:
+         decision = agent._tool_guardrail_halt_decision
+         _turn_exit_reason = "guardrail_halt"
+-        final_response = agent._toolguard_controlled_halt_response(decision)
++        final_response = controlled_halt_response(decision)
+         agent._emit_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+         append_message(messages, {"role": "assistant", "content": final_response})
+         # Emit the halt so it isn't mistaken for a crash; the stream callback is still
+@@ -245,7 +281,7 @@ def stage_tool_call_message(
+     # narration isn't attributed to the preceding tool turn), and clear the mute flag a
+     # prior housekeeping turn set, else _vprint suppresses this turn's tool progress.
+     _all_housekeeping = all(
+-        tc.function.name in _HOUSEKEEPING_TOOLS for tc in assistant_message.tool_calls
++        tc.function.name in HOUSEKEEPING_TOOL_NAMES for tc in assistant_message.tool_calls
+     )
+     if assistant_message.tool_calls and not _all_housekeeping:
+         agent._last_content_with_tools = None
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/provider-wait-event.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/provider-wait-event.test.tsx
+index 1136a14119..4b4a5de36c 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/provider-wait-event.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/provider-wait-event.test.tsx
+@@ -27,9 +27,12 @@ describe('provider wait visibility', () => {
+   })
+ 
+   it('surfaces explained waits but ignores generic spinner rewrites', () => {
+-    emit('thinking.delta', { text: '⏳ waiting on local-model — 30s with no output yet' })
++    emit('thinking.delta', {
++      text: '⏳ waiting on local-model — request active; no visible output after 30s. Reasoning will appear automatically if the backend streams it; automatic recovery check at 180s.'
++    })
+     expect($providerWaitSessions.get()).toEqual({
+-      [SID]: '⏳ waiting on local-model — 30s with no output yet'
++      [SID]:
++        '⏳ waiting on local-model — request active; no visible output after 30s. Reasoning will appear automatically if the backend streams it; automatic recovery check at 180s.'
+     })
+ 
+     emit('thinking.delta', { text: '◉_◉ cogitating...' })
+diff --git a/apps/desktop/src/store/reasoning-disclosure.ts b/apps/desktop/src/store/reasoning-disclosure.ts
+index 584c00a57a..e2204bc5b1 100644
+--- a/apps/desktop/src/store/reasoning-disclosure.ts
++++ b/apps/desktop/src/store/reasoning-disclosure.ts
+@@ -5,7 +5,7 @@ import { persistBoolean, storedBoolean } from '@/lib/storage'
+ const REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY = 'hermes.desktop.reasoning.collapsedByDefault'
+ 
+ /** Desktop-local presentation preference; shared backend config must not be changed by a single window. */
+-export const $reasoningCollapsedByDefault = atom(storedBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, false))
++export const $reasoningCollapsedByDefault = atom(storedBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, true))
+ 
+ $reasoningCollapsedByDefault.subscribe(value => persistBoolean(REASONING_COLLAPSED_BY_DEFAULT_STORAGE_KEY, value))
+ 
+diff --git a/apps/desktop/vitest.setup.ts b/apps/desktop/vitest.setup.ts
+index 1eea75165e..4fc4243216 100644
+--- a/apps/desktop/vitest.setup.ts
++++ b/apps/desktop/vitest.setup.ts
+@@ -7,7 +7,9 @@ import { configure } from '@testing-library/react'
+ // accessor shadows jsdom's Storage and every `localStorage.getItem(...)` in a
+ // test throws "Cannot read properties of undefined". Install a real in-memory
+ // Storage when the global resolves to nothing, before any test module reads it.
+-if (typeof (globalThis as any).localStorage === 'undefined') {
++const installedStorage = (globalThis as any).localStorage
++
++if (typeof installedStorage?.getItem !== 'function') {
+   const store = new Map<string, string>()
+   const storage: Storage = {
+     get length() {
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 12a3bec0da..23663b32e4 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -3746,9 +3746,27 @@ def generate_launchd_plist() -> str:
+     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
+ 
+     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping stderr.
++    gateway_command = _timestamped_stderr_gateway_command(
++        log_dir / "gateway.error.log", external_supervisor=True
++    )
++    # A local Desktop customization may install a fail-closed compatibility
++    # entrypoint outside the replaceable Hermes checkout. Treat it as part of
++    # the canonical service definition so `hermes gateway start` and Desktop
++    # upgrades preserve the preflight instead of silently overwriting it.
++    compatibility_entrypoint = (
++        get_hermes_home()
++        / "customizations"
++        / "frontier-harness"
++        / "gateway_start.py"
++    )
++    if compatibility_entrypoint.is_file():
++        gateway_command = [
++            str(Path(venv_dir) / "bin" / "python"),
++            str(compatibility_entrypoint),
++        ]
+     prog_args_xml = "\n        ".join(
+         f"<string>{part}</string>"
+-        for part in _timestamped_stderr_gateway_command(log_dir / "gateway.error.log", external_supervisor=True)
++        for part in gateway_command
+     )
+ 
+     # Persist the configured RLIMIT_NOFILE floor: launchd defaults to soft 256, and every plist
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index bc45188e48..731d35dee8 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -450,6 +450,8 @@ class PluginContext:
+         self, name: str, toolset: str, schema: dict, handler: Callable,
+         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
+         description: str = "", emoji: str = "", override: bool = False,
++        execution_timeout_seconds: float | Callable | None = None,
++        accepts_progress_callback: bool = False,
+     ) -> Optional[PluginRegistration]:
+         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
+         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
+@@ -459,6 +461,10 @@ class PluginContext:
+         ``override=True`` against a built-in tool requires the operator to opt in via
+         ``plugins.entries.<plugin_id>.allow_tool_override: true`` in config.yaml — mirrors the trust gate
+         pattern used for ``ctx.llm`` provider/model overrides (#23194).
++
++        ``execution_timeout_seconds`` may be a fixed duration or a callable receiving
++        the parsed tool arguments. Set ``accepts_progress_callback=True`` only for
++        tools that project bounded, user-visible progress into the host UI.
+         """
+         if override and not self._tool_override_allowed(name):
+             raise PluginToolOverrideError(
+@@ -477,6 +483,8 @@ class PluginContext:
+             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
+             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
+             override=override, scope=scope,
++            execution_timeout_seconds=execution_timeout_seconds,
++            accepts_progress_callback=accepts_progress_callback,
+         )
+         registered = registry.snapshot_registration(name, scope=scope)
+         handle = None
+diff --git a/hermes_cli/timeouts.py b/hermes_cli/timeouts.py
+index 71b1880c17..143f5044ef 100644
+--- a/hermes_cli/timeouts.py
++++ b/hermes_cli/timeouts.py
+@@ -10,7 +10,12 @@ def _coerce_timeout(raw: object) -> float | None:
+ 
+ 
+ def _configured_timeout(provider_id: str, model: str | None, model_key: str, provider_key: str) -> float | None:
+-    """Per-model ``providers.<id>.models.<model>.<model_key>`` wins over ``providers.<id>.<provider_key>``."""
++    """Per-model ``providers.<id>.models.<model>.<model_key>`` wins over ``providers.<id>.<provider_key>``.
++
++    After named custom providers collapse to ``custom``, resolve by unique model
++    membership so the named provider's timeout is not silently lost. Ambiguity
++    fails closed rather than borrowing a different endpoint's policy.
++    """
+     if not provider_id:
+         return None
+     try:
+@@ -19,8 +24,8 @@ def _configured_timeout(provider_id: str, model: str | None, model_key: str, pro
+     except Exception:
+         return None
+     providers = config.get("providers", {}) if isinstance(config, dict) else {}
+-    provider_config = providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+-    if not isinstance(provider_config, dict):
++    provider_config = _resolve_provider_config(providers, provider_id, model)
++    if provider_config is None:
+         return None
+     model_config = _get_model_config(provider_config, model)
+     if model_config is not None:
+@@ -30,6 +35,34 @@ def _configured_timeout(provider_id: str, model: str | None, model_key: str, pro
+     return _coerce_timeout(provider_config.get(provider_key))
+ 
+ 
++def _resolve_provider_config(
++    providers: object,
++    provider_id: str,
++    model: str | None,
++) -> dict[str, object] | None:
++    """Resolve timeout config after named custom providers become ``custom``."""
++    if not isinstance(providers, dict):
++        return None
++    direct = providers.get(provider_id)
++    if isinstance(direct, dict):
++        return direct
++    normalized = str(provider_id or "").strip().lower()
++    if normalized != "custom" and not normalized.startswith("custom:"):
++        return None
++    if not model:
++        return None
++    matches: list[dict[str, object]] = []
++    for candidate in providers.values():
++        if not isinstance(candidate, dict):
++            continue
++        models = candidate.get("models")
++        contains_model = isinstance(models, dict) and model in models
++        default_model = str(candidate.get("model") or "") == model
++        if contains_model or default_model:
++            matches.append(candidate)
++    return matches[0] if len(matches) == 1 else None
++
++
+ def get_provider_request_timeout(provider_id: str, model: str | None = None) -> float | None:
+     """Return a configured provider request timeout in seconds, if any."""
+     return _configured_timeout(provider_id, model, "timeout_seconds", "request_timeout_seconds")
+diff --git a/model_tools.py b/model_tools.py
+index 2cc38e5aff..e5b20811e0 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -16,7 +16,7 @@ from contextvars import ContextVar
+ import logging
+ import threading
+ import time
+-from typing import Dict, Any, List, Optional, Tuple
++from typing import Dict, Any, List, Optional, Tuple, Callable
+ 
+ from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
+ from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
+@@ -811,10 +811,13 @@ def _approval_observability(ids: _CallIds):
+ 
+ 
+ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
+-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
++                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool,
++                  tool_progress_callback: Optional[Callable] = None) -> Any:
+     """Run the registry handler (through tool-execution middleware unless skipped)
+     with the approval observability context bound for the duration."""
+     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
++    if tool_progress_callback is not None:
++        dispatch_kwargs["tool_progress_callback"] = tool_progress_callback
+     if function_name == "execute_code":
+         # Prefer the caller's list so subagents can't overwrite the parent's
+         # tool set via the process-global.
+@@ -868,6 +871,7 @@ def handle_function_call(
+     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
+     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
++    tool_progress_callback: Optional[Callable] = None,
+ ) -> str:
+     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
+ 
+@@ -912,6 +916,7 @@ def handle_function_call(
+             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
+             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
+             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
++            tool_progress_callback=tool_progress_callback,
+         )
+ 
+     from tools.tool_gateway.names import is_connector_name, parse_connector_name
+@@ -945,7 +950,8 @@ def handle_function_call(
+         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
+         start = time.monotonic()
+         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
+-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
++                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware,
++                               tool_progress_callback=tool_progress_callback)
+         duration_ms = _elapsed_ms(start)
+         _emit(result, duration_ms=duration_ms)
+         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+diff --git a/tests/agent/test_frontier_harness.py b/tests/agent/test_frontier_harness.py
 new file mode 100644
-index 00000000000..d692b348f5b
+index 0000000000..306549eb83
+--- /dev/null
++++ b/tests/agent/test_frontier_harness.py
+@@ -0,0 +1,78 @@
++"""Frontier harness loop-signal tests."""
++
++import json
++
++from agent.frontier_harness import _analyze, _failed_result, _persist
++
++
++def test_successful_terminal_dump_is_not_a_failure():
++    payload = json.dumps(
++        {
++            "output": "void had_error_handler()\n{\n    // error path\n}\n",
++            "exit_code": 0,
++            "error": None,
++        }
++    )
++    assert _failed_result(payload) is False
++
++
++def test_nonzero_exit_is_a_failure():
++    payload = json.dumps({"output": "boom", "exit_code": 1, "error": None})
++    assert _failed_result(payload) is True
++
++
++def test_analyze_does_not_mark_path_drift_on_successful_source_dumps():
++    messages = [
++        {"role": "user", "content": "Okay go ahead and continue"},
++        {
++            "role": "assistant",
++            "tool_calls": [
++                {
++                    "id": "c1",
++                    "function": {
++                        "name": "terminal",
++                        "arguments": json.dumps({"command": "grep error kernel.cuh"}),
++                    },
++                }
++            ],
++        },
++        {
++            "role": "tool",
++            "tool_call_id": "c1",
++            "name": "terminal",
++            "content": json.dumps(
++                {
++                    "output": "exl3_moe_kernel.cuh: error handler for warp",
++                    "exit_code": 0,
++                    "error": None,
++                }
++            ),
++        },
++    ]
++    state = _analyze(messages, {"path_deviation_failure_streak": 2, "max_unproductive_actions": 4})
++    assert state["failure_count"] == 0
++    assert state["path_health"] != "path_drift"
++
++
++def test_persist_keeps_stop_next_action(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    state = {
++        "phase": "repair",
++        "path_health": "path_drift",
++        "next_action": "stop tools; inspect the last failure, change strategy, then verify",
++        "trailing_failure_streak": 2,
++        "goal": "continue",
++        "verification_required": True,
++        "progress_digest": "abc",
++    }
++    _persist("session-x", "glm-test", state)
++    saved = json.loads(next((tmp_path / "frontier_runs").glob("*.json")).read_text())
++    assert saved["resume_contract"]["next_action"].startswith("stop tools")
++
++
++def test_frontier_protocol_includes_codex_turn_and_stale_anchor_rules():
++    from agent.frontier_harness import _PROTOCOL
++
++    assert "Codex turn rule" in _PROTOCOL
++    assert "old_text/old_string" in _PROTOCOL
++    assert "user-visible assistant message" in _PROTOCOL
+diff --git a/tests/agent/test_tool_guardrails.py b/tests/agent/test_tool_guardrails.py
+index 63ae5debd3..6b18fcdec1 100644
+--- a/tests/agent/test_tool_guardrails.py
++++ b/tests/agent/test_tool_guardrails.py
+@@ -3,11 +3,13 @@
+ import json
+ 
+ from agent.tool_guardrails import (
++    LoopCapConfig,
+     ToolCallGuardrailConfig,
+     ToolCallGuardrailController,
+     ToolCallSignature,
+     canonical_tool_args,
+     classify_tool_failure,
++    classify_user_goal_kind,
+ )
+ 
+ 
+@@ -250,12 +252,6 @@ def test_identical_call_streak_never_halts_when_hard_stop_disabled_or_for_poller
+ 
+ # ── Per-turn runaway-loop caps (Claude Code v2.1.212, Week 29) ──────────────
+ 
+-from agent.tool_guardrails import LoopCapConfig  # noqa: E402
+-
+-
+-
+-
+-
+ 
+ def test_loop_cap_zero_disables_and_junk_falls_back():
+     # 0 is a legitimate "unlimited" value; negatives / junk fall back to default.
+@@ -282,6 +278,456 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
+     assert decision.should_halt is True
+ 
+ 
++def test_classify_user_goal_kind_distinguishes_ping_status_and_continue():
++    assert classify_user_goal_kind("Sorry are you there?") == "ping"
++    assert classify_user_goal_kind("are you there") == "ping"
++    assert classify_user_goal_kind("Are you stuck?") == "ping"
++    assert classify_user_goal_kind("Where are we at so far?") == "status"
++    assert classify_user_goal_kind("Please share an update") == "status"
++    assert classify_user_goal_kind("sooory continue please") == "work"
++    assert classify_user_goal_kind("please keep going on the calib") == "work"
++    assert classify_user_goal_kind("Okay go ahead and continue") == "work"
++
++
++def test_ping_blocks_the_first_tool_call():
++    controller = ToolCallGuardrailController()
++    controller.observe_user_goal("Sorry are you there?")
++    blocked = controller.before_call("execute_code", {"code": "print(1)"})
++    assert blocked.action == "block"
++    assert blocked.code == "tool_only_reply_required_block"
++    assert "I am here" in blocked.message
++
++
++def test_status_ask_allows_one_tool_only_round_then_blocks():
++    controller = ToolCallGuardrailController()
++    controller.observe_user_goal("Where are we at so far?")
++    assert controller.before_call("execute_code", {"code": "print(1)"}).action == "allow"
++    controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP BRAKE" in notice
++    blocked = controller.before_call("execute_code", {"code": "print(2)"})
++    assert blocked.action == "block"
++    assert blocked.code == "tool_only_reply_required_block"
++
++
++def test_work_turn_nudges_after_streak_but_does_not_halt():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(max_tool_only_iterations=3, commentary_gate_after=0)
++    )
++    controller.observe_user_goal("continue the HY4 calib")
++    for i in range(3):
++        assert controller.before_call("execute_code", {"code": str(i)}).action == "allow"
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP NUDGE" in notice
++    assert controller.before_call("execute_code", {"code": "4"}).action == "allow"
++
++
++def test_work_reasoning_still_counts_as_mute_tool_loop():
++    # Codex: reasoning items are not a user-visible assistant message.
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            max_tool_only_iterations=2, work_tool_only_halt_after=0, commentary_gate_after=0
++        )
++    )
++    controller.observe_user_goal("keep going on A1")
++    for i in range(2):
++        assert controller.before_call("execute_code", {"code": str(i)}).action == "allow"
++        controller.observe_assistant_round(
++            has_tool_calls=True, has_visible_text=False, has_reasoning=True
++        )
++    assert controller.tool_only_streak == 2
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP NUDGE" in notice
++
++
++def test_work_turn_halts_after_ignored_nudges():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            max_tool_only_iterations=2, work_tool_only_halt_after=4, commentary_gate_after=0
++        )
++    )
++    controller.observe_user_goal("continue the HY4 calib")
++    for i in range(4):
++        assert controller.before_call("execute_code", {"code": str(i)}).action == "allow"
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP BRAKE" in notice
++    blocked = controller.before_call("execute_code", {"code": "halt"})
++    assert blocked.action == "block"
++    assert blocked.code == "tool_only_reply_required_block"
++
++
++def test_visible_text_with_tools_resets_work_streak():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(max_tool_only_iterations=2)
++    )
++    controller.observe_user_goal("keep going")
++    controller.before_call("execute_code", {"code": "1"})
++    controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    controller.observe_assistant_round(has_tool_calls=True, has_visible_text=True)
++    assert controller.tool_only_streak == 0
++    assert controller.before_call("execute_code", {"code": "2"}).action == "allow"
++
++
++def test_config_parses_tool_only_brake_thresholds():
++    cfg = ToolCallGuardrailConfig.from_mapping(
++        {
++            "max_tool_only_iterations": 6,
++            "work_tool_only_halt_after": 12,
++            "status_ask_max_tool_only": 2,
++            "ping_max_tool_only": 0,
++        }
++    )
++    assert cfg.max_tool_only_iterations == 6
++    assert cfg.work_tool_only_halt_after == 12
++    assert cfg.status_ask_max_tool_only == 2
++    assert cfg.ping_max_tool_only == 0
++
++
++def test_config_parses_codex_stale_anchor_and_housekeeping_caps():
++    cfg = ToolCallGuardrailConfig.from_mapping(
++        {
++            "housekeeping_tool_only_halt_after": 3,
++            "stale_anchor_block_after": 1,
++            "work_tool_only_halt_after": 24,
++            "commentary_gate_after": 2,
++        }
++    )
++    assert cfg.housekeeping_tool_only_halt_after == 3
++    assert cfg.stale_anchor_block_after == 1
++    assert cfg.work_tool_only_halt_after == 24
++    assert cfg.commentary_gate_after == 2
++
++
++def test_config_parses_commentary_gate_empty_cap():
++    cfg = ToolCallGuardrailConfig.from_mapping({"commentary_gate_empty_cap": 3})
++    assert cfg.commentary_gate_empty_cap == 3
++
++
++def test_commentary_gate_arms_after_mute_rounds_and_continues_turn():
++    """Codex mid-turn rule: mute tools → tools-off commentary → continue, not halt."""
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            max_tool_only_iterations=8,
++            work_tool_only_halt_after=24,
++            commentary_gate_after=2,
++        )
++    )
++    controller.observe_user_goal("keep going on A1")
++    for i in range(2):
++        assert controller.before_call("execute_code", {"code": str(i)}).action == "allow"
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "COMMENTARY GATE" in notice
++    assert controller.begin_commentary_request() is True
++    assert controller.commentary_gate_active() is True
++    # Tools stay allowed in before_call — the request omits them; halt path is separate.
++    assert controller.before_call("execute_code", {"code": "should-not-run"}).action == "allow"
++    assert controller.finish_commentary_request(has_visible_text=True) is True
++    assert controller.tool_only_streak == 0
++    assert controller.commentary_gate_active() is False
++    assert controller.begin_commentary_request() is False
++
++
++def test_commentary_gate_empty_response_rearms_tools_off():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(commentary_gate_after=2, work_tool_only_halt_after=24)
++    )
++    controller.observe_user_goal("continue")
++    for i in range(2):
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.begin_commentary_request() is True
++    assert controller.finish_commentary_request(has_visible_text=False) is True
++    assert controller.tool_only_streak == 2
++    assert controller.begin_commentary_request() is True
++
++
++def test_commentary_gate_empty_response_cap_restores_tools():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            commentary_gate_after=2,
++            commentary_gate_empty_cap=2,
++            work_tool_only_halt_after=24,
++        )
++    )
++    controller.observe_user_goal("continue")
++    for i in range(2):
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.begin_commentary_request() is True
++    assert controller.finish_commentary_request(has_visible_text=False) is True
++    assert controller.begin_commentary_request() is True
++    assert controller.finish_commentary_request(has_visible_text=False) is False
++    assert controller.commentary_gate_active() is False
++    assert controller.begin_commentary_request() is False
++
++
++def _armed_commentary_controller():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(commentary_gate_after=2, work_tool_only_halt_after=24)
++    )
++    controller.observe_user_goal("continue")
++    for _ in range(2):
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.begin_commentary_request() is True
++    return controller
++
++
++def test_commentary_gate_forces_empty_tools_even_when_caller_passes_none():
++    from types import SimpleNamespace
++
++    from agent.chat_completion_helpers import (
++        _apply_commentary_gate_to_tools,
++        _strip_tools_from_kwargs_for_commentary_gate,
++    )
++
++    controller = _armed_commentary_controller()
++    tools = [{"type": "function", "function": {"name": "execute_code"}}]
++    agent = SimpleNamespace(_tool_guardrails=controller, tools=tools)
++    assert _apply_commentary_gate_to_tools(agent, None) == []
++    assert _apply_commentary_gate_to_tools(agent, tools) == []
++    kwargs = {"model": "x", "tools": tools, "functions": tools, "extra_body": {"tools": tools}}
++    _strip_tools_from_kwargs_for_commentary_gate(agent, kwargs)
++    assert "tools" not in kwargs
++    assert "functions" not in kwargs
++    assert "tools" not in kwargs["extra_body"]
++
++
++def test_commentary_gate_inactive_keeps_default_tools():
++    from types import SimpleNamespace
++
++    from agent.chat_completion_helpers import _apply_commentary_gate_to_tools
++
++    tools = [{"type": "function", "function": {"name": "execute_code"}}]
++    agent = SimpleNamespace(_tool_guardrails=ToolCallGuardrailController(), tools=tools)
++    assert _apply_commentary_gate_to_tools(agent, None) is tools
++
++
++def test_redecorate_does_not_restore_tools_when_commentary_gate_active():
++    from types import SimpleNamespace
++
++    from agent.conversation_loop import _redecorate_prompt_cache_for_provider
++
++    controller = _armed_commentary_controller()
++    tools = [{"type": "function", "function": {"name": "execute_code"}}]
++    agent = SimpleNamespace(
++        _tool_guardrails=controller,
++        tools=tools,
++        _use_prompt_caching=False,
++        provider="openai",
++        client=None,
++    )
++    messages = [{"role": "user", "content": "hi"}]
++    _out, _prepared, planned = _redecorate_prompt_cache_for_provider(
++        agent, messages, tools_for_api=[]
++    )
++    assert planned == []
++    _out2, _prepared2, planned_from_none = _redecorate_prompt_cache_for_provider(
++        agent, messages, tools_for_api=None
++    )
++    assert planned_from_none == []
++
++
++def test_phase_after_commentary_gate_drops_tool_calls_without_text():
++    from types import SimpleNamespace
++
++    from agent.conversation_loop import _phase_after_commentary_gate, finish_text_response
++
++    controller = _armed_commentary_controller()
++    agent = SimpleNamespace(
++        _tool_guardrails=controller,
++        session_id="s",
++        _strip_think_blocks=lambda t: t,
++    )
++    msg = SimpleNamespace(content="", tool_calls=[{"id": "1"}])
++    assert _phase_after_commentary_gate(agent, msg) is finish_text_response
++    assert msg.tool_calls is None
++    assert controller.commentary_gate_active() is True
++
++
++def test_phase_after_commentary_gate_preamble_then_tools():
++    from types import SimpleNamespace
++
++    from agent.conversation_loop import _phase_after_commentary_gate, run_tool_round
++
++    controller = _armed_commentary_controller()
++    agent = SimpleNamespace(
++        _tool_guardrails=controller,
++        session_id="s",
++        _strip_think_blocks=lambda t: t,
++    )
++    msg = SimpleNamespace(content="Still working on A1.", tool_calls=[{"id": "1"}])
++    assert _phase_after_commentary_gate(agent, msg) is run_tool_round
++    assert msg.tool_calls == [{"id": "1"}]
++    assert controller.commentary_gate_active() is False
++    assert controller.tool_only_streak == 0
++
++
++def test_commentary_gate_disabled_when_zero():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(commentary_gate_after=0, max_tool_only_iterations=2)
++    )
++    controller.observe_user_goal("continue")
++    for i in range(2):
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.begin_commentary_request() is False
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP NUDGE" in notice
++
++
++def test_mute_halt_still_outranks_commentary_gate():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            commentary_gate_after=2,
++            max_tool_only_iterations=2,
++            work_tool_only_halt_after=4,
++        )
++    )
++    controller.observe_user_goal("continue")
++    for i in range(4):
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.begin_commentary_request() is False
++    notice = controller.consume_tool_only_brake_notice()
++    assert notice and "TOOL LOOP BRAKE" in notice
++    blocked = controller.before_call("execute_code", {"code": "halt"})
++    assert blocked.code == "tool_only_reply_required_block"
++
++
++def test_tool_only_halt_copy_is_not_a_retry_accusation():
++    from agent.tool_guardrails import controlled_halt_response
++
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(max_tool_only_iterations=1, work_tool_only_halt_after=2)
++    )
++    controller.observe_user_goal("please continue")
++    controller.before_call("execute_code", {"code": "1"})
++    controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    controller.before_call("execute_code", {"code": "2"})
++    controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    blocked = controller.before_call("memory", {"action": "replace", "old_text": "stale"})
++    assert blocked.code == "tool_only_reply_required_block"
++    text = controlled_halt_response(blocked)
++    assert "retrying memory" not in text.lower()
++    assert "Codex" in text
++    assert "assistant message" in text.lower()
++
++
++def test_housekeeping_only_mute_halts_before_productive_work_cap():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            max_tool_only_iterations=8,
++            work_tool_only_halt_after=24,
++            housekeeping_tool_only_halt_after=2,
++        )
++    )
++    controller.observe_user_goal("keep going on A1")
++    for i in range(6):
++        assert controller.before_call("terminal", {"command": f"ls {i}"}).action == "allow"
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.tool_only_streak == 6
++    assert controller.before_call("memory", {"action": "add", "content": "x"}).action == "allow"
++    controller.observe_assistant_round(
++        has_tool_calls=True, has_visible_text=False, housekeeping_only=True
++    )
++    assert controller.before_call("todo_list", {"todos": []}).action == "allow"
++    controller.observe_assistant_round(
++        has_tool_calls=True, has_visible_text=False, housekeeping_only=True
++    )
++    blocked = controller.before_call("memory", {"action": "add", "content": "y"})
++    assert blocked.action == "block"
++    assert blocked.code == "tool_only_reply_required_block"
++    assert "housekeeping" in blocked.message.lower()
++    assert "retrying memory" not in blocked.message.lower()
++
++
++def test_productive_mute_tools_are_not_cut_by_housekeeping_cap():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(
++            max_tool_only_iterations=8,
++            work_tool_only_halt_after=24,
++            housekeeping_tool_only_halt_after=2,
++        )
++    )
++    controller.observe_user_goal("continue")
++    for i in range(8):
++        assert controller.before_call("write_file", {"path": f"a{i}", "content": "x"}).action == "allow"
++        controller.observe_assistant_round(has_tool_calls=True, has_visible_text=False)
++    assert controller.tool_only_streak == 8
++    assert controller.housekeeping_only_streak == 0
++    assert controller.before_call("terminal", {"command": "true"}).action == "allow"
++
++
++def test_stale_memory_replace_blocks_identical_retry_without_hard_stop():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=False, stale_anchor_block_after=1)
++    )
++    args = {"action": "replace", "target": "memory", "old_text": "gone", "content": "new"}
++    result = json.dumps({
++        "success": False,
++        "error": "No entry matched 'gone'. Check current_entries below and retry with the exact text.",
++        "current_entries": ["live entry"],
++    })
++    warned = controller.after_call("memory", args, result, failed=True)
++    assert warned.action == "warn"
++    assert warned.code == "stale_anchor_retry_warning"
++    assert "Do not retry the same old_text" in warned.message
++    blocked = controller.before_call("memory", args)
++    assert blocked.action == "block"
++    assert blocked.code == "stale_anchor_retry_block"
++    from agent.tool_guardrails import controlled_halt_response
++    text = controlled_halt_response(blocked)
++    assert "retrying memory" not in text.lower()
++    assert "anchor" in text.lower()
++
++
++def test_stale_memory_allows_a_different_old_text():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=False, stale_anchor_block_after=1)
++    )
++    stale = {"action": "replace", "old_text": "gone", "content": "new"}
++    fresh = {"action": "replace", "old_text": "live entry", "content": "updated"}
++    controller.after_call(
++        "memory",
++        stale,
++        json.dumps({"success": False, "error": "No entry matched 'gone'."}),
++        failed=True,
++    )
++    assert controller.before_call("memory", stale).action == "block"
++    assert controller.before_call("memory", fresh).action == "allow"
++
++
++def test_stale_patch_old_string_blocks_identical_retry():
++    controller = ToolCallGuardrailController(
++        ToolCallGuardrailConfig(hard_stop_enabled=False, stale_anchor_block_after=1)
++    )
++    args = {"path": "x.py", "old_string": "missing", "new_string": "here"}
++    controller.after_call(
++        "patch", args, json.dumps({"error": "old_string not found. Use read_file."}), failed=True,
++    )
++    blocked = controller.before_call("patch", args)
++    assert blocked.action == "block"
++    assert blocked.code == "stale_anchor_retry_block"
++
++
++def test_classify_memory_no_match_is_a_failure():
++    failed, tag = classify_tool_failure(
++        "memory",
++        json.dumps({"success": False, "error": "No entry matched 'stale'."}),
++    )
++    assert failed is True
++    assert "stale-anchor" in tag
++
++
++def test_live_config_keeps_codex_mute_and_stale_anchor_policy():
++    from pathlib import Path
++
++    text = (Path.home() / ".hermes" / "config.yaml").read_text(encoding="utf-8")
++    assert "work_tool_only_halt_after: 24" in text
++    assert "housekeeping_tool_only_halt_after: 2" in text
++    assert "stale_anchor_block_after: 1" in text
++
++
++
+ 
+ 
+ 
+diff --git a/tests/hermes_cli/test_timeouts.py b/tests/hermes_cli/test_timeouts.py
+index 132152518c..e28fe0dbe1 100644
+--- a/tests/hermes_cli/test_timeouts.py
++++ b/tests/hermes_cli/test_timeouts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import textwrap
++from unittest.mock import patch
+ 
+ from hermes_cli.timeouts import (
+     get_provider_request_timeout,
+@@ -12,6 +13,40 @@ def _write_config(tmp_path, body: str) -> None:
+     (tmp_path / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+ 
+ 
++def test_named_custom_provider_timeout_survives_runtime_normalization():
++    config = {
++        "providers": {
++            "glm-5.3-flash": {
++                "model": "glm-5.3-flash-exl3-dspark",
++                "models": {
++                    "glm-5.3-flash-exl3-dspark": {
++                        "timeout_seconds": 1800,
++                        "stale_timeout_seconds": 300,
++                    }
++                },
++            }
++        }
++    }
++    with patch("hermes_cli.config.load_config_readonly", return_value=config):
++        assert get_provider_request_timeout(
++            "custom", "glm-5.3-flash-exl3-dspark"
++        ) == 1800
++        assert get_provider_stale_timeout(
++            "custom", "glm-5.3-flash-exl3-dspark"
++        ) == 300
++
++
++def test_custom_provider_timeout_fails_closed_when_model_is_ambiguous():
++    config = {
++        "providers": {
++            "one": {"models": {"shared-model": {"stale_timeout_seconds": 300}}},
++            "two": {"models": {"shared-model": {"stale_timeout_seconds": 600}}},
++        }
++    }
++    with patch("hermes_cli.config.load_config_readonly", return_value=config):
++        assert get_provider_stale_timeout("custom", "shared-model") is None
++
++
+ 
+ 
+ 
+@@ -103,4 +138,3 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
+ 
+ 
+ 
+-
+diff --git a/tests/run_agent/test_sequential_tool_timeout.py b/tests/run_agent/test_sequential_tool_timeout.py
+index 3f0f606611..22f8cf8e43 100644
+--- a/tests/run_agent/test_sequential_tool_timeout.py
++++ b/tests/run_agent/test_sequential_tool_timeout.py
+@@ -347,3 +347,16 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
+     assert "timed out" not in messages[0]["content"]
+     assert messages[1]["content"] == "second result"
+     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
++
++def test_registered_tool_timeout_overrides_generic_deadline(monkeypatch):
++    from agent.tool_executor import _resolve_registered_tool_timeout
++
++    class _Entry:
++        execution_timeout_seconds = 12.0
++
++    monkeypatch.setattr(
++        "tools.registry.registry.get_entry",
++        lambda name, scope=None: _Entry() if name == "long_plugin" else None,
++    )
++    assert _resolve_registered_tool_timeout("long_plugin", {}, 3.0) == 12.0
++    assert _resolve_registered_tool_timeout("ordinary", {}, 3.0) == 3.0
+diff --git a/tests/run_agent/test_wait_state_visibility.py b/tests/run_agent/test_wait_state_visibility.py
+index f80f6a1df7..a4f95fc1c2 100644
+--- a/tests/run_agent/test_wait_state_visibility.py
++++ b/tests/run_agent/test_wait_state_visibility.py
+@@ -63,6 +63,68 @@ def test_emit_wait_notice_without_callback_still_touches_activity(tmp_path, monk
+     assert "waiting on test-model" in agent.get_activity_summary()["last_activity_desc"]
+ 
+ 
++def test_provider_wait_notice_reports_active_request_without_guessing_failure():
++    """A quiet live request must not be labelled slow, overloaded, or broken."""
++    from agent import chat_completion_helpers as h
++
++    notice = h._provider_wait_notice(
++        model="glm-5.3-flash-exl3-dspark",
++        elapsed=150.9,
++        recovery="; automatic recovery check at 180s",
++        streaming=True,
++    )
++
++    assert notice == (
++        "⏳ waiting on glm-5.3-flash-exl3-dspark — request active; no visible "
++        "output after 150s. Reasoning will appear automatically if the backend "
++        "streams it; automatic recovery check at 180s."
++    )
++    assert "slow" not in notice
++    assert "overloaded" not in notice
++
++
++def test_nonstream_provider_wait_notice_explains_buffered_response():
++    from agent import chat_completion_helpers as h
++
++    notice = h._provider_wait_notice(
++        model="local-model", elapsed=30, streaming=False
++    )
++
++    assert "request active" in notice
++    assert "returns displayable output only when its response arrives" in notice
++
++
++def test_desktop_countdown_wait_does_not_rewrite_thinking_spinner(tmp_path, monkeypatch):
++    """Desktop already has a pulse + elapsed timer. Do not paint 30s banners."""
++    from agent import chat_completion_helpers as h
++
++    seen: list = []
++    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
++    agent.platform = "desktop"
++    notice = h._provider_wait_notice(
++        model="glm-5.3-flash-exl3-dspark",
++        elapsed=90,
++        streaming=True,
++    )
++    h._surface_countdown_wait(agent, notice)
++
++    assert seen == []
++    summary = agent.get_activity_summary()
++    assert "waiting on glm-5.3-flash-exl3-dspark" in summary["last_activity_desc"]
++
++
++def test_cli_countdown_wait_still_rewrites_spinner(tmp_path, monkeypatch):
++    from agent import chat_completion_helpers as h
++
++    seen: list = []
++    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
++    agent.platform = "cli"
++    notice = h._provider_wait_notice(model="local-model", elapsed=30, streaming=True)
++    h._surface_countdown_wait(agent, notice)
++
++    assert seen == [notice]
++
++
+ 
+ 
+ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
+diff --git a/tests/test_dispatch_session_id.py b/tests/test_dispatch_session_id.py
+index 69a6e592f0..871380ed57 100644
+--- a/tests/test_dispatch_session_id.py
++++ b/tests/test_dispatch_session_id.py
+@@ -18,6 +18,21 @@ def _make_registry(captured: dict):
+ 
+ class TestSessionIdForwarding:
+ 
++    def test_standard_path_forwards_progress_callback(self):
++        """The host UI callback reaches the registry without becoming global state."""
++        captured = {}
++        callback = object()
++        with patch("model_tools.registry", _make_registry(captured)):
++            from model_tools import handle_function_call
++            handle_function_call(
++                "web_search",
++                {"query": "test"},
++                task_id="t1",
++                tool_progress_callback=callback,
++                skip_pre_tool_call_hook=True,
++            )
++        assert captured.get("tool_progress_callback") is callback
++
+     def test_standard_path_forwards_session_id(self):
+         """registry.dispatch receives session_id on the normal tool path."""
+         captured = {}
+diff --git a/tests/tools/test_registry.py b/tests/tools/test_registry.py
+index 6573941fda..c7e1460ffd 100644
+--- a/tests/tools/test_registry.py
++++ b/tests/tools/test_registry.py
+@@ -40,6 +40,46 @@ class TestRegisterAndDispatch:
+         result = json.loads(reg.dispatch("alpha", {}))
+         assert result == {"ok": True}
+ 
++    def test_progress_callback_requires_explicit_tool_opt_in(self):
++        reg = ToolRegistry()
++        seen = {}
++
++        def handler(args, **kwargs):
++            seen.update(kwargs)
++            return json.dumps({"ok": True})
++
++        reg.register(
++            name="ordinary",
++            toolset="core",
++            schema=_make_schema("ordinary"),
++            handler=handler,
++        )
++        callback = object()
++        reg.dispatch("ordinary", {}, tool_progress_callback=callback, task_id="t1")
++
++        assert "tool_progress_callback" not in seen
++        assert seen["task_id"] == "t1"
++
++    def test_progress_callback_reaches_opted_in_tool(self):
++        reg = ToolRegistry()
++        seen = {}
++
++        def handler(args, **kwargs):
++            seen.update(kwargs)
++            return json.dumps({"ok": True})
++
++        callback = object()
++        reg.register(
++            name="progress_tool",
++            toolset="plugin",
++            schema=_make_schema("progress_tool"),
++            handler=handler,
++            accepts_progress_callback=True,
++        )
++        reg.dispatch("progress_tool", {}, tool_progress_callback=callback)
++
++        assert seen["tool_progress_callback"] is callback
++
+ 
+     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
+         """Parallel MCP registrations with one name leave exactly one owner."""
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index c7d77d23d5..3c810e7cee 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -699,6 +699,56 @@ def execute_code(
+                 "it could complete (SIGTERM propagates to child processes). "
+                 "Run the lifecycle command from a shell outside the gateway."
+             )
++
++    def _fixed_anc_node_timeout_hint(code: str) -> Optional[str]:
++        """Reject the known nested Node timeout anti-pattern without regex guessing.
++
++        The historic failure used ``subprocess.run(["node", "/tmp/anc.js"],
++        timeout=45)`` inside execute_code. The inner deadline fires before Hermes'
++        outer sandbox budget and surfaces a long traceback. Only literal numeric
++        timeouts on a literal ``/tmp/anc.js`` subprocess call are rejected.
++        """
++        try:
++            import ast
++            tree = ast.parse(code)
++        except (SyntaxError, TypeError, ValueError):
++            return None
++        for node in ast.walk(tree):
++            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
++                continue
++            owner = node.func.value
++            if not (
++                isinstance(owner, ast.Name)
++                and owner.id == "subprocess"
++                and node.func.attr in {"run", "check_call", "check_output"}
++                and node.args
++            ):
++                continue
++            has_anc = any(
++                isinstance(part, ast.Constant)
++                and isinstance(part.value, str)
++                and part.value == "/tmp/anc.js"
++                for part in ast.walk(node.args[0])
++            )
++            if not has_anc:
++                continue
++            timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
++            if (
++                isinstance(timeout, ast.Constant)
++                and isinstance(timeout.value, (int, float))
++                and not isinstance(timeout.value, bool)
++                and timeout.value > 0
++            ):
++                return (
++                    f"Fixed timeout={timeout.value:g}s on /tmp/anc.js is blocked because "
++                    "it can terminate healthy work before Hermes' execute_code deadline. "
++                    "Omit the nested timeout and rely on execute_code's outer budget."
++                )
++        return None
++
++    fixed_timeout_hint = _fixed_anc_node_timeout_hint(code)
++    if fixed_timeout_hint:
++        return tool_error(fixed_timeout_hint)
+     from tools.terminal_tool import _get_env_config, _docker_has_host_access
+     _env_config = _get_env_config()
+     env_type = _env_config["env_type"]
+diff --git a/tools/frontier_harness_audit.py b/tools/frontier_harness_audit.py
+new file mode 100755
+index 0000000000..d692b348f5
 --- /dev/null
 +++ b/tools/frontier_harness_audit.py
 @@ -0,0 +1,119 @@
@@ -2074,9 +3545,95 @@ index 00000000000..d692b348f5b
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index adf740d5c9..87b3e06778 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -187,6 +187,16 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
+     if operations:
+         if not isinstance(operations, list):
+             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
++        normalized_operations = []
++        for operation in operations:
++            if not isinstance(operation, dict):
++                normalized_operations.append(operation)
++                continue
++            normalized = dict(operation)
++            if normalized.get("content") is None and normalized.get("new_text") is not None:
++                normalized["content"] = normalized["new_text"]
++            normalized_operations.append(normalized)
++        operations = normalized_operations
+         denied = _background_delete_gate(action, operations, target)
+         if denied is not None:
+             return denied
+@@ -283,7 +293,10 @@ MEMORY_SCHEMA = {
+         "notes (environment, conventions, tool quirks, lessons).\n\n"
+         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
+         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
+-        "procedures belong in a skill, not memory."
++        "procedures belong in a skill, not memory.\n\n"
++        "STALE ANCHOR: if replace/remove fails because old_text was not found, do not retry "
++        "that same old_text. Read current_entries and use a unique substring that exists now, "
++        "or skip the write and continue the user's task."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/registry.py b/tools/registry.py
+index b82ae4aeea..5205e17f38 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -15,7 +15,7 @@ import threading
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Callable, Dict, List, Optional, Set
++from typing import Any, Callable, Dict, List, Optional, Set
+ 
+ from hermes_constants import hermes_home_key
+ 
+@@ -178,6 +178,8 @@ class ToolEntry:
+     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
+     # — for fields tracking runtime config (delegate_task's description reflects limits).
+     dynamic_schema_overrides: Optional[Callable] = None
++    execution_timeout_seconds: Any = None
++    accepts_progress_callback: bool = False
+ 
+ 
+ class _PluginOverridePolicy:
+@@ -598,7 +600,9 @@ class ToolRegistry:
+         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
+         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
+         dynamic_schema_overrides: Callable = None, override: bool = False,
+-        scope: Optional[str] = None):
++        scope: Optional[str] = None,
++        execution_timeout_seconds: float | Callable | None = None,
++        accepts_progress_callback: bool = False):
+         """Register a tool (called at import time by each tool file). ``override=True`` is an
+         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
+         browser backend); without it, cross-toolset shadowing is rejected."""
+@@ -651,7 +655,9 @@ class ToolRegistry:
+                 requires_env=requires_env or [], is_async=is_async,
+                 description=description or schema.get("description", ""), emoji=emoji,
+                 max_result_size_chars=max_result_size_chars,
+-                dynamic_schema_overrides=dynamic_schema_overrides)
++                dynamic_schema_overrides=dynamic_schema_overrides,
++                execution_timeout_seconds=execution_timeout_seconds,
++                accepts_progress_callback=accepts_progress_callback)
+             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
+             # longer gates a toolset; it still feeds get_toolset_requirements ->
+             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
+@@ -814,6 +820,8 @@ class ToolRegistry:
+         entry = self.get_entry(name, scope=scope)
+         if not entry:
+             return tool_error(f"Unknown tool: {name}")
++        if not entry.accepts_progress_callback:
++            kwargs.pop("tool_progress_callback", None)
+         try:
+             if entry.is_async:
+                 from model_tools import _run_async
 diff --git a/tools/statem_mcp_server.py b/tools/statem_mcp_server.py
 new file mode 100755
-index 00000000000..dc6f7011988
+index 0000000000..dc6f701198
 --- /dev/null
 +++ b/tools/statem_mcp_server.py
 @@ -0,0 +1,186 @@
@@ -2266,23 +3823,3 @@ index 00000000000..dc6f7011988
 +    """Return bounded resume context while history stays in artifacts."""
 +    return _packet(run_id)
 +if __name__ == "__main__": mcp.run()
-diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
---- a/agent/conversation_loop.py
-+++ b/agent/conversation_loop.py
-@@ -6706,3 +6706,15 @@
-             normalized = _transport.normalize_response(response, **_normalize_kwargs)
-             assistant_message = normalized
-+            # Provider-neutral response contract: OpenAI-compatible providers
-+            # may omit tool_calls on ordinary text turns, or expose an
-+            # immutable sequence instead of the SDK list. Normalize only the
-+            # container here; valid provider-specific call parsing remains in
-+            # the transport adapters, and DeepSeek's reasoning/tool path is
-+            # otherwise untouched.
-+            _raw_tool_calls = getattr(assistant_message, "tool_calls", None)
-+            if _raw_tool_calls is None:
-+                assistant_message.tool_calls = []
-+            elif isinstance(_raw_tool_calls, tuple):
-+                assistant_message.tool_calls = list(_raw_tool_calls)
-+            elif not isinstance(_raw_tool_calls, list):
-+                assistant_message.tool_calls = []
-             finish_reason = normalized.finish_reason
