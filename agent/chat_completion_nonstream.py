@@ -163,8 +163,16 @@ class _NonStreamRequest:
             if not self.wait_notice.should_emit(phase, watchdog):
                 self.agent._touch_activity(f"waiting for provider response ({int(silence)}s, {phase})")
                 return
-            self.agent._emit_wait_notice(wn.wait_notice_text(
-                self.api_kwargs.get('model', 'the provider'), silence, phase, watchdog))
+            recovery = h._codex_wait_notice_recovery(
+                stale_timeout=wd.stale_timeout, ttfb_enabled=wd.ttfb_enabled,
+                ttfb_timeout=wd.ttfb_timeout, last_event_ts=last_event_ts,
+                last_progress_ts=last_progress_ts, retry_started_ts=retry_started_ts,
+                call_start=self.call_start, idle_enabled=wd.idle_enabled,
+                idle_timeout=wd.idle_timeout, idle_requires_progress=wd.idle_requires_progress,
+                elapsed=elapsed)
+            h._surface_countdown_wait(self.agent, h._provider_wait_notice(
+                model=self.api_kwargs.get('model', 'the provider'), elapsed=elapsed,
+                recovery=recovery, streaming=False))
             self.wait_notice_started_ts = self.call_start + elapsed
         except Exception:
             h.logger.debug("wait-notice construction failed", exc_info=True)

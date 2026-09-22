@@ -27,9 +27,12 @@ describe('provider wait visibility', () => {
   })
 
   it('surfaces explained waits but ignores generic spinner rewrites', () => {
-    emit('thinking.delta', { text: '⏳ waiting on local-model — 30s with no output yet' })
+    emit('thinking.delta', {
+      text: '⏳ waiting on local-model — request active; no visible output after 30s. Reasoning will appear automatically if the backend streams it; automatic recovery check at 180s.'
+    })
     expect($providerWaitSessions.get()).toEqual({
-      [SID]: '⏳ waiting on local-model — 30s with no output yet'
+      [SID]:
+        '⏳ waiting on local-model — request active; no visible output after 30s. Reasoning will appear automatically if the backend streams it; automatic recovery check at 180s.'
     })
 
     emit('thinking.delta', { text: '◉_◉ cogitating...' })

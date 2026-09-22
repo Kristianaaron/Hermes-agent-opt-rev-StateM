@@ -1065,3 +1065,158 @@ class TestPromptCacheKeyCapability:
             request_overrides={"prompt_cache_key": "   "},
         )
         assert "prompt_cache_key" not in kwargs
+
+
+class TestDsv41SparkVllmRails:
+    """Custom vLLM Spark must get the GLM-class think/output rails on the wire."""
+
+    _model = "deepseek-ai/DeepSeek-V4.1-Flash"
+    _spark = "http://spark-d167.tail54ff2c.ts.net:8000/v1"
+    _msgs = [{"role": "user", "content": "Hi"}]
+
+    def test_spark_forces_max_tokens_budget_ngram_without_penalties(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url=self._spark,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["max_tokens"] == 32768
+        extra = kw["extra_body"]
+        assert extra["thinking_token_budget"] == 12288
+        assert extra["repetition_detection"] == {
+            "max_pattern_size": 24, "min_pattern_size": 4, "min_count": 4,
+        }
+        assert "frequency_penalty" not in kw
+        assert "presence_penalty" not in kw
+        assert "frequency_penalty" not in extra
+        assert "presence_penalty" not in extra
+        assert kw["top_p"] == 0.95
+        assert kw["temperature"] == 0.3
+        assert extra["chat_template_kwargs"]["thinking"] is True
+        assert "stop" not in kw
+        assert "stop" not in extra
+
+    def test_spark_rejects_greedy_temperature(self, transport):
+        from providers import get_provider_profile
+
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            provider_profile=get_provider_profile("custom"),
+            base_url=self._spark, temperature=0,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["temperature"] == 0.3
+
+    def test_spark_clamps_huge_max_tokens(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url=self._spark, max_tokens=65536,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["max_tokens"] == 32768
+
+    def test_spark_raises_tiny_max_tokens_so_think_cannot_eat_content(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url=self._spark, max_tokens=256,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["max_tokens"] == 20480
+
+    def test_official_deepseek_api_is_not_patched(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url="https://api.deepseek.com/v1",
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert "max_tokens" not in kw
+        extra = kw.get("extra_body") or {}
+        assert "thinking_token_budget" not in extra
+        assert "repetition_detection" not in extra
+        assert "presence_penalty" not in kw
+        assert "frequency_penalty" not in kw
+
+    def test_thinking_off_still_caps_output_without_budget(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url=self._spark,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": False, "effort": "none"},
+        )
+        assert kw["max_tokens"] == 32768
+        extra = kw.get("extra_body") or {}
+        assert "thinking_token_budget" not in extra
+        assert extra["repetition_detection"]["min_pattern_size"] == 4
+        assert extra["chat_template_kwargs"]["thinking"] is False
+        assert extra["chat_template_kwargs"]["enable_thinking"] is False
+        assert "presence_penalty" not in kw
+        assert "frequency_penalty" not in kw
+        assert kw["temperature"] == 0.3
+
+    def test_thinking_off_strips_config_max_think_extra_body(self, transport):
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            base_url=self._spark,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": False, "effort": "none"},
+            request_overrides={
+                "extra_body": {
+                    "thinking_token_budget": 12288,
+                    "chat_template_kwargs": {
+                        "thinking": True,
+                        "enable_thinking": True,
+                        "reasoning_effort": "max",
+                    },
+                }
+            },
+        )
+        extra = kw["extra_body"]
+        assert "thinking_token_budget" not in extra
+        assert extra["chat_template_kwargs"]["thinking"] is False
+        assert extra["chat_template_kwargs"]["enable_thinking"] is False
+        assert "reasoning_effort" not in extra["chat_template_kwargs"]
+
+    def test_custom_profile_path_still_applies(self, transport):
+        from providers import get_provider_profile
+
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            provider_profile=get_provider_profile("custom"),
+            base_url=self._spark,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["max_tokens"] == 32768
+        assert kw["extra_body"]["thinking_token_budget"] == 12288
+        assert "presence_penalty" not in kw
+        assert "frequency_penalty" not in kw
+        assert kw["top_p"] == 0.95
+
+    def test_spark_strips_config_extra_body_penalties(self, transport):
+        from providers import get_provider_profile
+
+        kw = transport.build_kwargs(
+            model=self._model, messages=self._msgs,
+            provider_profile=get_provider_profile("custom"),
+            base_url=self._spark,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+            reasoning_config={"enabled": True, "effort": "max"},
+            extra_body_additions={
+                "presence_penalty": 0.2,
+                "frequency_penalty": 0.4,
+            },
+            request_overrides={
+                "presence_penalty": 0.2,
+                "frequency_penalty": 0.4,
+            },
+        )
+        extra = kw["extra_body"]
+        assert "presence_penalty" not in kw
+        assert "frequency_penalty" not in kw
+        assert "presence_penalty" not in extra
+        assert "frequency_penalty" not in extra

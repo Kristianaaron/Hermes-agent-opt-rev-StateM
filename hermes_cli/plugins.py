@@ -461,6 +461,8 @@ class PluginContext:
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", override: bool = False,
+        execution_timeout_seconds: float | Callable | None = None,
+        accepts_progress_callback: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
@@ -470,6 +472,10 @@ class PluginContext:
         ``override=True`` against a built-in tool requires the operator to opt in via
         ``plugins.entries.<plugin_id>.allow_tool_override: true`` in config.yaml — mirrors the trust gate
         pattern used for ``ctx.llm`` provider/model overrides (#23194).
+
+        ``execution_timeout_seconds`` may be a fixed duration or a callable receiving
+        the parsed tool arguments. Set ``accepts_progress_callback=True`` only for
+        tools that project bounded, user-visible progress into the host UI.
         """
         if override and not self._tool_override_allowed(name):
             raise PluginToolOverrideError(
@@ -488,6 +494,8 @@ class PluginContext:
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope,
+            execution_timeout_seconds=execution_timeout_seconds,
+            accepts_progress_callback=accepts_progress_callback,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None

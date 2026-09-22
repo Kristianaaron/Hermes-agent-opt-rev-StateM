@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import textwrap
+from unittest.mock import patch
 
 from hermes_cli.timeouts import (
+    get_provider_hard_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -10,6 +12,44 @@ from hermes_cli.timeouts import (
 
 def _write_config(tmp_path, body: str) -> None:
     (tmp_path / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+
+
+def test_named_custom_provider_timeout_survives_runtime_normalization():
+    config = {
+        "providers": {
+            "glm-5.3-flash": {
+                "model": "glm-5.3-flash-exl3-dspark",
+                "models": {
+                    "glm-5.3-flash-exl3-dspark": {
+                        "timeout_seconds": 1800,
+                        "stale_timeout_seconds": 300,
+                        "hard_timeout_seconds": 720,
+                    }
+                },
+            }
+        }
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        assert get_provider_request_timeout(
+            "custom", "glm-5.3-flash-exl3-dspark"
+        ) == 1800
+        assert get_provider_stale_timeout(
+            "custom", "glm-5.3-flash-exl3-dspark"
+        ) == 300
+        assert get_provider_hard_timeout(
+            "custom", "glm-5.3-flash-exl3-dspark"
+        ) == 720
+
+
+def test_custom_provider_timeout_fails_closed_when_model_is_ambiguous():
+    config = {
+        "providers": {
+            "one": {"models": {"shared-model": {"stale_timeout_seconds": 300}}},
+            "two": {"models": {"shared-model": {"stale_timeout_seconds": 600}}},
+        }
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        assert get_provider_stale_timeout("custom", "shared-model") is None
 
 
 
@@ -100,7 +140,6 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
     # Case C: no config, no env → 1800.0 default
     monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
     assert agent2._resolved_api_call_timeout() == 1800.0
-
 
 
 

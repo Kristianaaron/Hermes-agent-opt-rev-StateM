@@ -1,0 +1,12 @@
+name: glm-codex-effort
+version: "2.1.0"
+description: "Semantic GLM System-1 routing with bounded recovery, inspect-to-act gating, and compact context."
+author: "Kristian Aaron"
+kind: standalone
+manifest_version: 1
+compatibility:
+  hermes_plugin_api: 1
+  python: ">=3.11"
+platforms:
+  - linux
+  - macos

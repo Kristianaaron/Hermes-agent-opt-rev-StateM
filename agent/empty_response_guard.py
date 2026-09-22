@@ -45,6 +45,7 @@ Per project policy, no ``HERMES_*`` environment variables are involved —
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, List, Optional, Tuple
@@ -63,6 +64,64 @@ _ATTEMPTS_ATTR = "_empty_attempt_history"
 _STREAK_COST_ATTR = "_empty_streak_cost_usd"
 _ENABLED_ATTR = "_empty_guard_enabled"
 _THRESHOLD_ATTR = "_empty_guard_cost_threshold_usd"
+
+_CACHE_RECOVERY_MARKER = "\n\n[Hermes fresh-continuation recovery "
+
+
+def _is_openrouter_runtime(agent: Any) -> bool:
+    """Return True only for requests routed through OpenRouter."""
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    requested = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip().lower()
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+    return (
+        provider == "openrouter"
+        or requested == "openrouter"
+        or "openrouter.ai" in base_url
+    )
+
+
+def cache_safe_recovery_nudge(agent: Any, content: str, attempt: int) -> str:
+    """Give an OpenRouter empty-response recovery a fresh cache key.
+
+    OpenRouter response caching keys on the complete request body. The nonce
+    lives only in Hermes' synthetic recovery message, which is removed before
+    durable transcript projection. Normal prompts and local DeepSeek requests
+    are unchanged.
+    """
+    if not _is_openrouter_runtime(agent):
+        return content
+    base = str(content or "").split(_CACHE_RECOVERY_MARKER, 1)[0].rstrip()
+    session = str(getattr(agent, "session_id", "") or "session")[-16:]
+    nonce = secrets.token_hex(8)
+    return (
+        f"{base}{_CACHE_RECOVERY_MARKER}{session}:{int(attempt)}:{nonce}. "
+        "Generate a fresh continuation from the tool results; do not return "
+        "empty content.]"
+    )
+
+
+def refresh_recovery_nudge(agent: Any, messages: List[dict], attempt: int) -> bool:
+    """Rotate the newest synthetic recovery nudge before an empty retry."""
+    if not _is_openrouter_runtime(agent):
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        if not message.get("_empty_recovery_synthetic"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            return False
+        message["content"] = cache_safe_recovery_nudge(
+            agent, content, attempt
+        )
+        message["_openrouter_fresh_recovery"] = int(attempt)
+        return True
+    return False
 
 
 @dataclass(frozen=True)

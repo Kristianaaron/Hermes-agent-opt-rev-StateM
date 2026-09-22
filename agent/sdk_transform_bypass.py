@@ -37,6 +37,26 @@ def _is_plain_json_data(value: Any) -> bool:
     return False
 
 
+def _omit_genuinely_empty_tool_fields(request_kwargs: dict) -> dict:
+    """Remove empty tool fields after preparing an SDK-bypass request.
+
+    Chat-completions keeps a top-level ``tools=[]`` slot so the OpenAI SDK still
+    accepts the request while the real tools ride in ``extra_body``.  That slot
+    is valid only when ``extra_body.tools`` is non-empty; an actually tool-free
+    request must omit both fields because several OpenAI-compatible backends
+    reject an explicit empty array.
+    """
+    if not isinstance(request_kwargs, dict):
+        return request_kwargs
+    extra_body = request_kwargs.get("extra_body")
+    extra_tools = extra_body.get("tools") if isinstance(extra_body, dict) else None
+    if request_kwargs.get("tools") == [] and not extra_tools:
+        request_kwargs.pop("tools", None)
+    if isinstance(extra_body, dict) and extra_body.get("tools") == []:
+        extra_body.pop("tools", None)
+    return request_kwargs
+
+
 def bypass_sdk_request_transform(
     request_kwargs: dict,
     fields: tuple[str, ...] = RESPONSES_BYPASS_FIELDS,
@@ -63,7 +83,7 @@ def bypass_sdk_request_transform(
     merged = dict(extra_body) if isinstance(extra_body, dict) else {}
     # An explicit caller-provided extra_body entry keeps precedence (SDK post-transform merge).
     bypassed["extra_body"] = {**merged, **{f: v for f, v in moved.items() if f not in merged}}
-    return bypassed
+    return _omit_genuinely_empty_tool_fields(bypassed)
 
 
 def bypass_chat_sdk_request_transform(request_kwargs: dict, client: Any) -> dict:

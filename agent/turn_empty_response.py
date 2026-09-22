@@ -123,7 +123,12 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
             + (" and fallback attempts." if agent._fallback_chain else
                ". No fallback providers configured.")
         )
-        return "(empty)"
+        # Keep the sentinel only in durable history so continuation logic can
+        # recognize it. Never expose a literal ``(empty)`` as the user-facing
+        # response, even when the optional finalizer explainer is disabled.
+        from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
+
+        return "⚠️ No reply: " + EMPTY_RESPONSE_EXPLANATION.format(model=agent.model)
 
     reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
     logger.warning(

@@ -843,8 +843,16 @@ _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
-    if is_partial_stub and dropped_tools:
+    if dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
+        names = {str(n).lower() for n in dropped_tools}
+        if names & {"write_file", "write_files", "create_file"}:
+            return (
+                f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was truncated by the "
+                "output length limit. Do NOT retry write_file with the full file. Output the "
+                "complete document as assistant message text only, starting with <!DOCTYPE html> "
+                "and ending with </html>. No tool call, no markdown fences.]"
+            )
         return (
             f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and "
             "the stream timed out before it could be delivered. Do NOT retry the same tool call "
@@ -1130,9 +1138,19 @@ def _redecorate_prompt_cache_for_provider(
         messages = _peel_moa_guidance(messages, guidance)
 
     strip_anthropic_cache_control(messages)
-    planned_tools = strip_anthropic_tool_cache_control(
-        tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
-    )
+    gate_omits_tools = False
+    try:
+        gate_omits_tools = bool(
+            getattr(getattr(agent, "_tool_guardrails", None), "commentary_gate_active", lambda: False)()
+        )
+    except Exception:
+        gate_omits_tools = False
+    if gate_omits_tools:
+        planned_tools = []
+    else:
+        planned_tools = strip_anthropic_tool_cache_control(
+            tools_for_api if tools_for_api is not None else getattr(agent, "tools", [])
+        )
     if prepared is not None and getattr(agent, "provider", None) == "moa":
         # Prepared MoA state is canonical: the synchronous acting-aggregator
         # sender owns its destination-local cache plan after it resolves the slot.
@@ -1166,9 +1184,58 @@ def _redecorate_prompt_cache_for_provider(
         )
         messages, planned_tools = plan.messages, plan.tools
 
+    if gate_omits_tools:
+        planned_tools = []
+        return messages, prepared, planned_tools
     if tools_for_api is None:
         return messages, prepared
     return messages, prepared, planned_tools
+
+
+def _phase_after_commentary_gate(agent, assistant_message):
+    """Choose ``run_tool_round`` or ``finish_text_response`` after a commentary-gate call.
+
+    Codex: visible mid-turn speech is commentary, not ``final_answer``. If a tools-off
+    call still emitted tool_calls with no visible status, drop them so empty/commentary
+    recovery runs instead of executing tools (which would leave the gate stuck active).
+    Visible text plus tool_calls is preamble+tools: close the gate, then execute.
+    """
+    tool_calls = getattr(assistant_message, "tool_calls", None)
+    gate_active = False
+    try:
+        gate_active = bool(
+            getattr(getattr(agent, "_tool_guardrails", None), "commentary_gate_active", lambda: False)()
+        )
+    except Exception:
+        gate_active = False
+    if gate_active and tool_calls:
+        raw = getattr(assistant_message, "content", None) or ""
+        if not isinstance(raw, str):
+            raw = ""
+        strip = getattr(agent, "_strip_think_blocks", None)
+        try:
+            visible = (strip(raw) if callable(strip) else raw).strip()
+        except Exception:
+            visible = raw.strip()
+        if visible:
+            try:
+                finish = getattr(getattr(agent, "_tool_guardrails", None), "finish_commentary_request", None)
+                if callable(finish):
+                    finish(has_visible_text=True)
+            except Exception:
+                logger.debug("Commentary gate preamble finish failed", exc_info=True)
+            return run_tool_round
+        try:
+            assistant_message.tool_calls = None
+        except Exception:
+            pass
+        logger.info(
+            "Commentary gate: dropping tool_calls with no visible status "
+            "(session=%s)",
+            getattr(agent, "session_id", None) or "none",
+        )
+        return finish_text_response
+    return run_tool_round if tool_calls else finish_text_response
 
 
 def _engine_overrides_hook(engine: Any, name: str) -> bool:
@@ -1496,6 +1563,28 @@ def _run_conversation_turn(
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
 
+    try:
+        from agent.statem_runtime import begin_turn_protocol
+        agent._frontier_protocol, agent._frontier_generation = begin_turn_protocol(agent, _ctx.turn_id)
+    except Exception:
+        agent._frontier_protocol = agent._frontier_generation = None
+        logger.debug("StateM turn protocol start failed", exc_info=True)
+    if not persist_user_display_kind:
+        try:
+            from agent.statem_runtime import observe_user_turn
+            observe_user_turn(agent, _ctx.original_user_message, _ctx.turn_id)
+        except Exception:
+            logger.debug("StateM user-turn observation failed", exc_info=True)
+    try:
+        _goal_text = _ctx.original_user_message
+        if not isinstance(_goal_text, str):
+            _goal_text = ""
+        observe_goal = getattr(agent._tool_guardrails, "observe_user_goal", None)
+        if callable(observe_goal):
+            observe_goal(_goal_text)
+    except Exception:
+        logger.debug("Tool-only brake user-goal observation failed", exc_info=True)
+
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not
     # the next; a SessionDB append failure (and its classified cause) halts only this turn;
@@ -1533,6 +1622,24 @@ def _run_conversation_turn(
         s.active_system_prompt = _sync_failover_system_message(agent, None, s.active_system_prompt)
 
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        try:
+            from agent.statem_runtime import turn_cancelled, turn_is_stale
+            _generation = getattr(agent, "_frontier_generation", None)
+            _protocol = getattr(agent, "_frontier_protocol", None)
+            if _generation is not None and turn_is_stale(agent, _generation):
+                s._turn_exit_reason = "superseded_by_new_turn"
+                if _protocol is not None:
+                    _protocol.finish(reason=s._turn_exit_reason, interrupted=True)
+                break
+            if turn_cancelled(agent):
+                s._turn_exit_reason = "statem_paused"
+                if _protocol is not None:
+                    _protocol.finish(reason=s._turn_exit_reason, interrupted=True)
+                if not agent.quiet_mode:
+                    agent._safe_print("\nStateM pause: stopping before the next model or tool action.")
+                break
+        except Exception:
+            logger.debug("StateM turn-liveness check failed", exc_info=True)
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
@@ -1567,7 +1674,7 @@ def _run_conversation_turn(
             if _ri.action == "continue":
                 continue
             _v = _run_phase(
-                run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
+                _phase_after_commentary_gate(agent, s.assistant_message), agent, s
             )
             if _v.action == "return":
                 return _v.result

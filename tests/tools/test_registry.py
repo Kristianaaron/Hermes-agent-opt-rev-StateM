@@ -60,6 +60,34 @@ class TestRegisterAndDispatch:
                      schema={"name": "noargs", "description": "x"}, handler=_dummy_handler)
         assert reg.get_entry("noargs") is not None
 
+    def test_progress_callback_requires_explicit_tool_opt_in(self):
+        reg = ToolRegistry()
+        seen = {}
+
+        def handler(args, **kwargs):
+            seen.update(kwargs)
+            return json.dumps({"ok": True})
+
+        reg.register(name="ordinary", toolset="core", schema=_make_schema("ordinary"), handler=handler)
+        callback = object()
+        reg.dispatch("ordinary", {}, tool_progress_callback=callback, task_id="t1")
+        assert "tool_progress_callback" not in seen
+        assert seen["task_id"] == "t1"
+
+    def test_progress_callback_reaches_opted_in_tool(self):
+        reg = ToolRegistry()
+        seen = {}
+
+        def handler(args, **kwargs):
+            seen.update(kwargs)
+            return json.dumps({"ok": True})
+
+        callback = object()
+        reg.register(name="progress_tool", toolset="plugin", schema=_make_schema("progress_tool"),
+                     handler=handler, accepts_progress_callback=True)
+        reg.dispatch("progress_tool", {}, tool_progress_callback=callback)
+        assert seen["tool_progress_callback"] is callback
+
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""

@@ -194,6 +194,16 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        normalized_operations = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                normalized_operations.append(operation)
+                continue
+            normalized = dict(operation)
+            if normalized.get("content") is None and normalized.get("new_text") is not None:
+                normalized["content"] = normalized["new_text"]
+            normalized_operations.append(normalized)
+        operations = normalized_operations
         denied = _background_delete_gate(action, operations, target)
         if denied is not None:
             return denied
@@ -290,7 +300,10 @@ MEMORY_SCHEMA = {
         "notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "procedures belong in a skill, not memory.\n\n"
+        "STALE ANCHOR: if replace/remove fails because old_text was not found, do not retry "
+        "that same old_text. Read current_entries and use a unique substring that exists now, "
+        "or skip the write and continue the user's task."
     ),
     "parameters": {
         "type": "object",

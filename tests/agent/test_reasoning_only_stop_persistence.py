@@ -107,6 +107,33 @@ def test_stall_guard_interim_row_carries_promoted_text_as_sidecar(loop_agent):
     assert "api_content" not in interim_wire
 
 
+def test_empty_recovery_planning_monologue_still_restores_the_tool_loop(loop_agent):
+    """Recovery suppresses ordinary recursive nudges, not a new reasoning-only plan."""
+    from tests.agent.test_run_agent import _mock_response
+
+    stalled = "I found the heading. Let me search for the remaining render sites."
+    loop_agent.valid_tool_names = {"search_files", "patch"}
+    loop_agent._stall_guards = True
+    history = [
+        {"role": "user", "content": "Make the headings thinner"},
+        {"role": "assistant", "content": "(empty)", "_empty_recovery_synthetic": True},
+    ]
+
+    with patch("agent.turn_final_response._latest_user_is_empty_recovery", return_value=True):
+        result = _run(
+            loop_agent,
+            [
+                _mock_response(content="", finish_reason="stop", reasoning_content=stalled),
+                _mock_response(content="Edit completed and verified.", finish_reason="stop"),
+            ],
+            user_message="You just executed tool calls but returned an empty response. Please continue.",
+            conversation_history=history,
+        )
+
+    assert result["api_calls"] == 2
+    assert result["final_response"] == "Edit completed and verified."
+
+
 def test_reasoning_only_clean_stop_logs_warning_with_route(loop_agent, caplog):
     from tests.agent.test_run_agent import _mock_response
 
@@ -119,6 +146,20 @@ def test_reasoning_only_clean_stop_logs_warning_with_route(loop_agent, caplog):
     assert f"model={loop_agent.model}" in hits[0].getMessage()
     assert "provider=deepseek" in hits[0].getMessage()
     assert "tool_turns=0" in hits[0].getMessage()
+
+
+def test_empty_recovery_cannot_recursively_trigger_stall_guard():
+    from agent.turn_final_response import _latest_user_is_empty_recovery
+
+    assert _latest_user_is_empty_recovery([
+        {"role": "user", "content": "recovery", "_empty_recovery_synthetic": True},
+    ])
+    assert not _latest_user_is_empty_recovery([
+        {"role": "user", "content": "[System: Continue now.]", "display_kind": "hidden"},
+    ])
+    assert not _latest_user_is_empty_recovery([
+        {"role": "user", "content": "please continue the edit"},
+    ])
 
 
 # ── planning-monologue stall: promoted reasoning must not fake a completion ──────────────────

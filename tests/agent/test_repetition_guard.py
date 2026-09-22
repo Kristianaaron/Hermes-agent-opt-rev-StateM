@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from agent.repetition_guard import MIN_FRAGMENT_LENGTH, is_repetition_dominated
+from agent.repetition_guard import (
+    MIN_FRAGMENT_LENGTH, is_repetition_dominated, should_abort_ngram_loop,
+)
 
 # The exact sentence from the #86581 incident (echoed hundreds of times by
 # the model before the provider cut it off at finish_reason=length).
@@ -48,3 +50,32 @@ class TestRepetitionGuard:
         assert is_repetition_dominated("") is False
         assert is_repetition_dominated(None) is False
         assert is_repetition_dominated(12345) is False
+
+    def test_short_ngram_loop_aborts_before_dominance_guard(self):
+        text = "user-scalable=no, " * 12
+        assert is_repetition_dominated(text) is False
+        assert should_abort_ngram_loop(text) is True
+
+    def test_four_repeats_of_24_char_window_abort(self):
+        pat = "0123456789abcdefghijklmn"
+        assert len(pat) == 24
+        assert should_abort_ngram_loop(pat * 4) is True
+        assert should_abort_ngram_loop(pat * 3) is False
+
+    def test_unique_prose_does_not_trip_ngram_abort(self):
+        text = " ".join(f"token-{i}" for i in range(80))
+        assert should_abort_ngram_loop(text) is False
+
+
+def test_length_continuation_aborts_on_ngram_loop():
+    from types import SimpleNamespace
+
+    from agent.turn_truncation import _REPETITION_DOMINATED, _abort_reason
+
+    agent = SimpleNamespace(
+        _has_content_after_think_block=lambda _c: True,
+        _strip_think_blocks=lambda c: c,
+    )
+    text = "0123456789abcdefghijklmn" * 4
+    assert _abort_reason(agent, text, False) == _REPETITION_DOMINATED
+    assert _abort_reason(agent, text, True) is None

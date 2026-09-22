@@ -9,12 +9,66 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed, is_guardrail_refusal
+from agent.tool_argument_normalization import is_long_lived_terminal_command
+
+
+# User messages that require a text reply instead of more tools.
+_PING_RE = re.compile(
+    r"^\s*(?:(?:so+rry|sorry|hey|hi|hello)[,.\s!]*)*"
+    r"(?:are you (?:still )?there|you there|still there|"
+    r"are you stuck|you stuck|still stuck|"
+    r"are you looping|is this looping)\s*[?.!]?\s*$",
+    re.I,
+)
+_STATUS_ASK_RE = re.compile(
+    r"(?:"
+    r"\bwhere are we(?:\s+at)?(?:\s+so far)?\b"
+    r"|\b(?:please\s+)?share an update\b"
+    r"|\bany (?:update|progress|news)\b"
+    r"|\bwhat(?:'s|s| is) going on\b"
+    r"|\bwhat(?:'s|s| is) the (?:status|update)\b"
+    r"|\b(?:status|progress) update\b"
+    r"|\bupdate please\b"
+    r"|\bare you stuck\b"
+    r"|\bdid you get stuck\b"
+    r"|\bis this looping\b"
+    r")",
+    re.I,
+)
+_CONTINUE_RE = re.compile(
+    r"\b(?:continue|keep going|keep working|proceed|carry on|resume|go ahead)\b",
+    re.I,
+)
+
+
+def classify_user_goal_kind(text: str) -> str:
+    """Classify the latest user prose for the tool-only brake.
+
+    Returns ``ping``, ``status``, or ``work``. Pings must be answered with
+    zero tools. Status asks get at most one tool round. Ordinary work is
+    nudged after ``max_tool_only_iterations`` mute rounds, then hard-stopped
+    after ``work_tool_only_halt_after`` so a thinking-model tool streak cannot
+    freeze the Desktop chat. Hidden chain-of-thought is not a user-visible
+    reply — matching the Codex harness, which ends a turn only on an
+    assistant message, not on reasoning items.
+    """
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 400:
+        return "work"
+    if _PING_RE.match(stripped):
+        return "ping"
+    if _STATUS_ASK_RE.search(stripped):
+        return "status"
+    if _CONTINUE_RE.search(stripped):
+        return "work"
+    return "work"
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset({
@@ -30,6 +84,17 @@ MUTATING_TOOL_NAMES = frozenset({
     "browser_click", "browser_type", "browser_press", "browser_scroll", "browser_navigate",
     "send_message", "cronjob_manage", "delegate_task", "process_manage",
 })
+
+# Post-response bookkeeping: a mute round made only of these is not productive Codex work.
+HOUSEKEEPING_TOOL_NAMES = frozenset({
+    "memory", "todo_list", "skill_manage", "session_search",
+})
+
+# Codex apply_patch / Hermes memory+patch: an unchanged failed anchor is not a new experiment.
+_STALE_ANCHOR_PATTERNS = {
+    "memory": re.compile(r"no entry matched|multiple entries matched", re.I),
+    "patch": re.compile(r"old_string not found", re.I),
+}
 
 # Pollers: legitimately re-invoked with identical args; the identical-call NOTICE never fires.
 STALL_GUARD_REPEATABLE_TOOLS = frozenset({"process_manage"})
@@ -90,6 +155,16 @@ def is_stall_guard_repeatable(tool_name: str) -> bool:
     return tool_name in STALL_GUARD_REPEATABLE_TOOLS or tool_name.endswith(_STALL_GUARD_REPEATABLE_SUFFIXES)
 
 
+def is_stale_anchor_failure(tool_name: str, result: str | None) -> bool:
+    """True when memory/patch failed because the edit anchor is gone or ambiguous.
+
+    Codex apply_patch treats a context mismatch as "do not retry the same hunk";
+    Hermes memory replace/remove and patch old_string have the same shape.
+    """
+    pattern = _STALE_ANCHOR_PATTERNS.get(tool_name)
+    return bool(pattern and result and pattern.search(result))
+
+
 def _is_non_interactive_platform(platform: str | None) -> bool:
     """True for gateway/cron sessions where tool loops are unattended."""
     if not isinstance(platform, str) or not platform.strip():
@@ -127,6 +202,24 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    cross_turn_identical_block_after: int = 3
+    max_total_tool_calls: int = 20
+    max_consecutive_read_only: int = 8
+    max_unproductive_tool_calls: int = 8
+    semantic_failure_halt_after: int = 3
+    max_tool_only_iterations: int = 8
+    work_tool_only_halt_after: int = 16
+    status_ask_max_tool_only: int = 1
+    ping_max_tool_only: int = 0
+    housekeeping_tool_only_halt_after: int = 2
+    # Codex commentary gate: after N mute tool rounds, the next API call omits
+    # tools so the model must emit a user-visible status sentence, then tools
+    # are restored and the turn continues. ``0`` disables the gate (halt-only).
+    commentary_gate_after: int = 2
+    # After this many empty tools-off commentary attempts, restore tools
+    # rather than looping tools-off empties until empty-response exhaustion.
+    commentary_gate_empty_cap: int = 2
+    stale_anchor_block_after: int = 1
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
@@ -149,7 +242,50 @@ class ToolCallGuardrailConfig:
             return _int_at_least(nested, getattr(d, name), 1)
 
         thresholds = {name: threshold(name, *src) for name, src in _THRESHOLD_SOURCES.items()}
-        return cls(loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")), **flags, **thresholds)
+        return cls(
+            loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
+            max_tool_only_iterations=_int_at_least(
+                data.get("max_tool_only_iterations"), d.max_tool_only_iterations, 0
+            ),
+            work_tool_only_halt_after=_int_at_least(
+                data.get("work_tool_only_halt_after"), d.work_tool_only_halt_after, 0
+            ),
+            status_ask_max_tool_only=_int_at_least(
+                data.get("status_ask_max_tool_only"), d.status_ask_max_tool_only, 0
+            ),
+            ping_max_tool_only=_int_at_least(
+                data.get("ping_max_tool_only"), d.ping_max_tool_only, 0
+            ),
+            housekeeping_tool_only_halt_after=_int_at_least(
+                data.get("housekeeping_tool_only_halt_after"), d.housekeeping_tool_only_halt_after, 0
+            ),
+            commentary_gate_after=_int_at_least(
+                data.get("commentary_gate_after"), d.commentary_gate_after, 0
+            ),
+            commentary_gate_empty_cap=_int_at_least(
+                data.get("commentary_gate_empty_cap"), d.commentary_gate_empty_cap, 1
+            ),
+            stale_anchor_block_after=_int_at_least(
+                data.get("stale_anchor_block_after"), d.stale_anchor_block_after, 0
+            ),
+            cross_turn_identical_block_after=_int_at_least(
+                data.get("cross_turn_identical_block_after"), d.cross_turn_identical_block_after, 1
+            ),
+            max_total_tool_calls=_int_at_least(
+                data.get("max_total_tool_calls"), d.max_total_tool_calls, 0
+            ),
+            max_consecutive_read_only=_int_at_least(
+                data.get("max_consecutive_read_only"), d.max_consecutive_read_only, 0
+            ),
+            max_unproductive_tool_calls=_int_at_least(
+                data.get("max_unproductive_tool_calls"), d.max_unproductive_tool_calls, 0
+            ),
+            semantic_failure_halt_after=_int_at_least(
+                data.get("semantic_failure_halt_after"), d.semantic_failure_halt_after, 1
+            ),
+            **flags,
+            **thresholds,
+        )
 
 
 @dataclass(frozen=True)
@@ -233,8 +369,13 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
 
     if tool_name == "memory":
         data = safe_json_loads(result)
-        if isinstance(data, dict) and data.get("success") is False and "exceed the limit" in data.get("error", ""):
-            return True, " [full]"
+        if isinstance(data, dict) and data.get("success") is False:
+            err = str(data.get("error") or "")
+            if "exceed the limit" in err.lower():
+                return True, " [full]"
+            if is_stale_anchor_failure("memory", err):
+                return True, " [stale-anchor]"
+            return True, " [error]"
     lower = result[:500].lower()
     return (True, " [error]") if '"error"' in lower or '"failed"' in lower or result.startswith("Error") else (False, "")
 
@@ -278,6 +419,32 @@ _DECISION_MESSAGES: dict[str, str] = {
     "loop_subagent_cap": (
         "Blocked delegate_task: this turn has already spawned {count} subagents (limit {cap}). "
         "This looks like a runaway delegation loop. Finish the work with the results you have and answer the user."
+    ),
+    "stale_anchor_retry_block": (
+        "Blocked {tool_name}: the edit anchor (old_text/old_string) was not found or was "
+        "ambiguous. Do not retry the same anchor. Read the current file or current_entries, "
+        "pick a unique substring that exists now, or skip this write and continue the user's task."
+    ),
+    "stale_anchor_retry_warning": (
+        "{tool_name} failed because the edit anchor was missing or ambiguous. "
+        "Do not retry the same old_text/old_string. Read current state and change the anchor, "
+        "or skip this write and continue the work."
+    ),
+    "total_tool_call_cap": (
+        "Stopped {tool_name}: this turn reached its bounded tool-action limit ({count}). "
+        "Return the result or a concise blocker instead of continuing an open-ended loop."
+    ),
+    "read_only_streak_halt": (
+        "Stopped {tool_name}: {count} consecutive inspection/read-only actions produced no mutation "
+        "or completion. Use the evidence already collected and answer, or make one concrete change."
+    ),
+    "unproductive_streak_halt": (
+        "Stopped {tool_name}: {count} consecutive actions failed or only inspected state without "
+        "making progress. Do not continue exploring; report the blocker or change strategy next turn."
+    ),
+    "semantic_failure_halt": (
+        "Stopped {tool_name}: the same action family failed {count} times even though the exact "
+        "arguments changed. The path is not working; report the blocker or choose a different approach."
     ),
 }
 
@@ -335,10 +502,247 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._total_tool_calls = 0
+        self._read_only_streak = 0
+        self._unproductive_streak = 0
+        self._semantic_failure_counts: dict[str, int] = {}
+        self._tool_only_streak = 0
+        self._housekeeping_only_streak = 0
+        self._force_text_reply = False
+        self._force_text_reason = ""
+        self._work_nudge_pending = False
+        self._work_nudge_emitted_at = 0
+        self._user_goal_kind = "work"
+        self._brake_notice_emitted = False
+        # Armed after mute rounds; active while the tools-off request is in flight.
+        self._commentary_gate_armed = False
+        self._commentary_gate_active = False
+        self._commentary_gate_empty_count = 0
+        self._recovery_block_counts: dict[ToolCallSignature, int] = {}
+        self._stale_anchor_counts: dict[ToolCallSignature, int] = {}
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    @property
+    def tool_only_streak(self) -> int:
+        return self._tool_only_streak
+
+    @property
+    def housekeeping_only_streak(self) -> int:
+        return self._housekeeping_only_streak
+
+    def _tool_only_cap(self) -> int:
+        if self._user_goal_kind == "ping":
+            return self.config.ping_max_tool_only
+        if self._user_goal_kind == "status":
+            return self.config.status_ask_max_tool_only
+        return self.config.max_tool_only_iterations
+
+    def observe_user_goal(self, text: str) -> None:
+        """Classify the user turn and arm the ping brake before the first tool."""
+        kind = classify_user_goal_kind(text)
+        self._user_goal_kind = kind
+        if kind == "ping" and self.config.ping_max_tool_only == 0:
+            self._force_text_reply = True
+            self._force_text_reason = "ping"
+
+    def observe_assistant_round(
+        self,
+        *,
+        has_tool_calls: bool,
+        has_visible_text: bool,
+        has_reasoning: bool = False,
+        housekeeping_only: bool = False,
+    ) -> None:
+        """Count consecutive tool-only assistant rounds in this turn.
+
+        ``has_reasoning`` is accepted for call-site compatibility but is not
+        user-visible progress. Codex's harness ends a turn only when the model
+        emits an assistant message; reasoning items keep the tool loop going.
+        GLM-max always streams CoT, so treating reasoning as a reply would
+        disable the mute-loop brake on the models that need it most.
+
+        ``housekeeping_only`` is a Codex-shaped tighter cap: memory/todo/skill
+        mute rounds are not productive work and must not ride the long work
+        mute budget.
+        """
+        del has_reasoning
+        if has_visible_text:
+            self._tool_only_streak = 0
+            self._housekeeping_only_streak = 0
+            self._work_nudge_emitted_at = 0
+            self._commentary_gate_armed = False
+            self._commentary_gate_empty_count = 0
+            if self._user_goal_kind == "work":
+                self._force_text_reply = False
+                self._force_text_reason = ""
+            return
+        if not has_tool_calls:
+            return
+        self._tool_only_streak += 1
+        if housekeeping_only:
+            self._housekeeping_only_streak += 1
+        else:
+            self._housekeeping_only_streak = 0
+        cap = self._tool_only_cap()
+        if self._user_goal_kind in {"ping", "status"}:
+            if cap == 0 or self._tool_only_streak >= cap:
+                self._force_text_reply = True
+                self._force_text_reason = self._user_goal_kind
+            return
+        housekeeping_halt = self.config.housekeeping_tool_only_halt_after
+        if housekeeping_only and housekeeping_halt > 0 and self._housekeeping_only_streak >= housekeeping_halt:
+            self._force_text_reply = True
+            self._force_text_reason = "housekeeping"
+            self._commentary_gate_armed = False
+            return
+        halt_after = self.config.work_tool_only_halt_after
+        if halt_after > 0 and self._tool_only_streak >= halt_after:
+            self._force_text_reply = True
+            self._force_text_reason = "mute"
+            self._commentary_gate_armed = False
+            return
+        gate_after = self.config.commentary_gate_after
+        if gate_after > 0 and self._tool_only_streak % gate_after == 0:
+            # Codex: mute tool-only is not a legal mid-turn state. Arm a tools-off
+            # commentary request instead of letting the mute streak grow.
+            self._commentary_gate_armed = True
+        if cap > 0 and self._tool_only_streak >= cap:
+            nudge_round = self._tool_only_streak // cap
+            if nudge_round > self._work_nudge_emitted_at:
+                self._work_nudge_pending = True
+                self._work_nudge_emitted_at = nudge_round
+
+    def begin_commentary_request(self) -> bool:
+        """If the commentary gate is armed, mark this API call tools-off and return True."""
+        if self._force_text_reply or not self._commentary_gate_armed:
+            return False
+        if self._user_goal_kind != "work":
+            return False
+        self._commentary_gate_active = True
+        self._commentary_gate_armed = False
+        return True
+
+    def commentary_gate_active(self) -> bool:
+        """True while the in-flight API call had tools omitted for commentary."""
+        return self._commentary_gate_active
+
+    def finish_commentary_request(self, *, has_visible_text: bool) -> bool:
+        """Complete a tools-off commentary call. Returns True when the turn must continue.
+
+        Visible commentary resets the mute streak (Codex: progress speech is not
+        ``final_answer``). Empty commentary re-arms the gate so the next attempt
+        still omits tools, until ``commentary_gate_empty_cap`` empties restore
+        tools rather than looping tools-off forever.
+        """
+        if not self._commentary_gate_active:
+            return False
+        self._commentary_gate_active = False
+        if has_visible_text:
+            self._tool_only_streak = 0
+            self._housekeeping_only_streak = 0
+            self._work_nudge_emitted_at = 0
+            self._work_nudge_pending = False
+            self._commentary_gate_armed = False
+            self._commentary_gate_empty_count = 0
+            return True
+        # Empty / think-only: keep the mute count and force another tools-off call.
+        self._commentary_gate_empty_count += 1
+        empty_cap = self.config.commentary_gate_empty_cap
+        if empty_cap > 0 and self._commentary_gate_empty_count >= empty_cap:
+            self._commentary_gate_armed = False
+            self._commentary_gate_empty_count = 0
+            return False
+        self._commentary_gate_armed = True
+        return True
+
+    def consume_tool_only_brake_notice(self) -> str | None:
+        """Nudge appended to the last tool result before the next API call."""
+        if self._force_text_reply and not self._brake_notice_emitted:
+            if self._user_goal_kind != "work" or self._tool_only_streak >= 1:
+                self._work_nudge_pending = False
+                self._brake_notice_emitted = True
+                return (
+                    "[TOOL LOOP BRAKE] Codex turn rule: stop calling tools. Reply to "
+                    "the user in plain text now. A turn ends only on a user-visible "
+                    "assistant message — hidden reasoning and more tools do not count. "
+                    "The next tool call will be blocked and this turn will end."
+                )
+        if self._commentary_gate_armed and not self._force_text_reply:
+            self._work_nudge_pending = False
+            return (
+                "[COMMENTARY GATE] Codex mid-turn rule: tools are suspended for the "
+                "next model call. Write one short status sentence for the user. That "
+                "sentence is commentary — the turn continues and tools are restored "
+                "after it. Hidden reasoning does not count."
+            )
+        if self._work_nudge_pending:
+            self._work_nudge_pending = False
+            remaining = max(
+                0,
+                self.config.work_tool_only_halt_after - self._tool_only_streak,
+            )
+            halt_hint = (
+                f" After {remaining} more mute tool rounds this turn will halt."
+                if remaining
+                else " The next mute tool round will halt this turn."
+            )
+            return (
+                "[TOOL LOOP NUDGE] Codex commentary required: write one short status "
+                "sentence to the user, then continue the work. Hidden reasoning does "
+                f"not count as a reply.{halt_hint} Tools remain allowed until the halt."
+            )
+        return None
+
+    def tool_only_halt_message(self) -> str:
+        if self._force_text_reason == "ping" or self._user_goal_kind == "ping":
+            return (
+                "I am here. I stopped a tool loop so I could answer you instead "
+                "of calling another tool. Send another message if you want me "
+                "to continue the work."
+            )
+        if self._force_text_reason == "status" or self._user_goal_kind == "status":
+            return (
+                "Stopping to answer you: I was still running tools instead of "
+                "reporting status. Send another message if you want me to "
+                "continue from the last tool result."
+            )
+        if self._force_text_reason == "housekeeping":
+            return (
+                f"Stopped after {self._housekeeping_only_streak} consecutive "
+                "housekeeping-only tool rounds (memory/todo) with no user-visible "
+                "reply. Codex requires an assistant message to finish a turn — "
+                "not more memory or todo calls. Send another message to continue."
+            )
+        return (
+            f"Stopped after {self._tool_only_streak} consecutive tool-only "
+            "rounds with no reply. Codex requires a user-visible assistant "
+            "message before more tools. Send another message to continue."
+        )
+
+    def _recoverable_block(self, decision: ToolGuardrailDecision) -> ToolGuardrailDecision:
+        signature = decision.signature
+        if signature is None:
+            return decision
+        count = self._recovery_block_counts.get(signature, 0) + 1
+        self._recovery_block_counts[signature] = count
+        if count < 2:
+            return decision
+        halted = ToolGuardrailDecision(
+            action="halt",
+            code=f"{decision.code}_repeated",
+            message=(
+                f"{decision.message} The model attempted to cross the same guardrail again; "
+                "execution is ending with a retained-state handoff."
+            ),
+            tool_name=decision.tool_name,
+            count=count,
+            signature=signature,
+        )
+        self._halt_decision = halted
+        return halted
 
     def _decide(
         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
@@ -356,10 +760,56 @@ class ToolCallGuardrailController:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
         allow = ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+        if self._force_text_reply:
+            return self._recoverable_block(ToolGuardrailDecision(
+                action="block",
+                code="tool_only_reply_required_block",
+                message=self.tool_only_halt_message(),
+                tool_name=tool_name,
+                count=max(self._tool_only_streak, 1),
+                signature=signature,
+            ))
+
+        total_cap = self.config.max_total_tool_calls
+        if self.config.hard_stop_enabled and total_cap > 0 and self._total_tool_calls >= total_cap:
+            return self._decide(
+                "halt", "total_tool_call_cap", tool_name, self._total_tool_calls, signature,
+            )
+        read_cap = self.config.max_consecutive_read_only
+        if (
+            self.config.hard_stop_enabled
+            and read_cap > 0
+            and _is_read_only_action(tool_name)
+            and self._read_only_streak >= read_cap
+        ):
+            return self._decide(
+                "halt", "read_only_streak_halt", tool_name, self._read_only_streak, signature,
+            )
+        unproductive_cap = self.config.max_unproductive_tool_calls
+        if (
+            self.config.hard_stop_enabled
+            and unproductive_cap > 0
+            and self._unproductive_streak >= unproductive_cap
+            and not _is_progress_candidate(tool_name, args)
+        ):
+            return self._decide(
+                "halt", "unproductive_streak_halt", tool_name, self._unproductive_streak, signature,
+            )
+
+        stale_count = self._stale_anchor_counts.get(signature, 0)
+        if (
+            self.config.stale_anchor_block_after > 0
+            and stale_count >= self.config.stale_anchor_block_after
+        ):
+            return self._recoverable_block(self._decide(
+                "block", "stale_anchor_retry_block", tool_name, stale_count, signature,
+            ))
 
         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
         cap_block = self._check_loop_cap(tool_name, args, signature)
         if cap_block is not None or not self.config.hard_stop_enabled:
+            if cap_block is None:
+                self._total_tool_calls += 1
             return cap_block or allow
         # A mutation since this call last failed makes the retry a new experiment.
         exact_count = 0 if self._progress_since_failure.get(signature) else self._exact_failure_counts.get(signature, 0)
@@ -368,6 +818,7 @@ class ToolCallGuardrailController:
         record = self._no_progress.get(signature) if self._is_idempotent(tool_name) else None
         if record is not None and record[1] >= self.config.no_progress_block_after:
             return self._decide("block", "idempotent_no_progress_block", tool_name, record[1], signature)
+        self._total_tool_calls += 1
         return allow
 
     def after_call(
@@ -378,16 +829,44 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+        if not failed and is_stale_anchor_failure(tool_name, result):
+            failed = True
         warnings = self.config.warnings_enabled
 
         if failed:
+            self._read_only_streak = self._read_only_streak + 1 if _is_read_only_action(tool_name) else 0
+            self._unproductive_streak += 1
+            family = _semantic_action_family(tool_name, args)
+            if family:
+                family_count = self._semantic_failure_counts.get(family, 0) + 1
+                self._semantic_failure_counts[family] = family_count
+                if (
+                    self.config.hard_stop_enabled
+                    and family_count >= self.config.semantic_failure_halt_after
+                ):
+                    return self._decide(
+                        "halt", "semantic_failure_halt", tool_name, family_count, signature,
+                    )
             # An identical failing call is only a REPLAY if nothing landed in between;
             # a mutation since the last identical failure restarts the exact-args streak.
             if self._progress_since_failure.pop(signature, False):
                 self._exact_failure_counts.pop(signature, None)
+                self._stale_anchor_counts.pop(signature, None)
             exact_count = self._exact_failure_counts[signature] = self._exact_failure_counts.get(signature, 0) + 1
             same_count = self._same_tool_failure_counts[tool_name] = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._no_progress.pop(signature, None)
+            stale = is_stale_anchor_failure(tool_name, result)
+            if stale:
+                stale_count = self._stale_anchor_counts[signature] = (
+                    self._stale_anchor_counts.get(signature, 0) + 1
+                )
+                if warnings:
+                    return self._decide(
+                        "warn", "stale_anchor_retry_warning", tool_name, stale_count, signature,
+                    )
+                return ToolGuardrailDecision(
+                    tool_name=tool_name, count=stale_count, signature=signature,
+                )
             # same_tool_failure counts DIFFERENT args on one tool; for failure-tolerant
             # tools a run of distinct red commands is diagnosis, not a loop — warn, never halt.
             if (
@@ -413,11 +892,21 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+        self._stale_anchor_counts.pop(signature, None)
         # A successful mutation is progress for every failing signature still counted
         # this turn. Pure loops never mutate between attempts, so the replay detector keeps its teeth.
         if tool_name in PROGRESS_RESET_TOOL_NAMES or file_mutation_result_landed(tool_name, result):
             self._progress_since_failure.update(dict.fromkeys(self._exact_failure_counts, True))
             self._same_tool_failure_counts.clear()
+        if _is_read_only_action(tool_name):
+            self._read_only_streak += 1
+            self._unproductive_streak += 1
+        elif _is_progress_candidate(tool_name, args):
+            self._read_only_streak = 0
+            self._unproductive_streak = 0
+            self._semantic_failure_counts.clear()
+        else:
+            self._read_only_streak = 0
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -564,6 +1053,19 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
     return json.dumps({"error": decision.message, "guardrail": decision.to_metadata()}, ensure_ascii=False)
 
 
+def controlled_halt_response(decision: ToolGuardrailDecision) -> str:
+    """User-visible halt copy. Mute-turn and stale-anchor brakes are not retry loops."""
+    code = decision.code or ""
+    if code.startswith("tool_only_reply_required") or code.startswith("stale_anchor"):
+        return decision.message
+    return (
+        f"I stopped retrying {decision.tool_name or 'a tool'} because it hit the tool-call guardrail "
+        f"({code}) after {decision.count} repeated non-progressing "
+        "attempts. The last tool result explains the blocker; the next step is "
+        "to change strategy instead of repeating the same call."
+    )
+
+
 def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
     """Append runtime guidance to the current tool result content."""
     if decision.action not in {"warn", "halt"} or not decision.message:
@@ -590,6 +1092,36 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
         "or a different tool that can make progress. If the blocker is external, report "
         "the blocker after one diagnostic attempt instead of repeating the same failing path."
     )
+
+
+def _is_read_only_action(tool_name: str) -> bool:
+    return tool_name in IDEMPOTENT_TOOL_NAMES or tool_name in {
+        "read_terminal", "browser_snapshot", "browser_console", "browser_get_images",
+    }
+
+
+def _is_progress_candidate(tool_name: str, args: Mapping[str, Any] | None) -> bool:
+    if tool_name == "terminal":
+        command = args.get("command") if isinstance(args, Mapping) else ""
+        return bool(command)
+    return tool_name in {
+        "write_file", "patch", "browser_click", "browser_type", "browser_press",
+        "browser_navigate", "send_message", "delegate_task", "cronjob", "cronjob_manage",
+        "todo", "todo_list", "memory", "skill_manage",
+    }
+
+
+def _semantic_action_family(tool_name: str, args: Mapping[str, Any] | None) -> str:
+    args = _coerce_args(args)
+    if tool_name in {"process", "process_manage"}:
+        return f"process:{str(args.get('action') or 'inspect').lower()}"
+    if tool_name.startswith("browser_"):
+        if _is_read_only_action(tool_name):
+            return "browser:inspect"
+        return f"browser:{tool_name.removeprefix('browser_')}"
+    if tool_name == "terminal" and is_long_lived_terminal_command(args.get("command")):
+        return "terminal:server_start"
+    return ""
 
 
 def _ordinal(count: int) -> str:

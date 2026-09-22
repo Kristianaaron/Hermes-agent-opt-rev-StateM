@@ -52,6 +52,15 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
+
+
+def _spark_stream_should_abort_ngram(api_kwargs: dict, reasoning_parts: list, content_parts: list) -> bool:
+    model = str((api_kwargs or {}).get("model") or "").lower()
+    if "v4.1-flash" not in model and "v4.1_flash" not in model:
+        return False
+    from agent.repetition_guard import SPARK_NGRAM_MIN_COUNT, SPARK_NGRAM_WINDOW, should_abort_ngram_loop
+    return (should_abort_ngram_loop("".join(reasoning_parts), window=SPARK_NGRAM_WINDOW, min_count=SPARK_NGRAM_MIN_COUNT)
+            or should_abort_ngram_loop("".join(content_parts), window=SPARK_NGRAM_WINDOW, min_count=SPARK_NGRAM_MIN_COUNT))
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 
@@ -519,6 +528,40 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
+def _codex_wait_notice_recovery(*, stale_timeout: float, ttfb_enabled: bool, ttfb_timeout: float,
+    last_event_ts: Optional[float], last_progress_ts: Optional[float], retry_started_ts: Optional[float],
+    call_start: float, idle_enabled: bool, idle_timeout: float, idle_requires_progress: bool, elapsed: float) -> str:
+    deadlines: list[float] = []
+    if math.isfinite(stale_timeout): deadlines.append(stale_timeout)
+    if retry_started_ts is not None and ttfb_enabled and math.isfinite(ttfb_timeout):
+        deadlines.append(max(0.0, retry_started_ts - call_start) + ttfb_timeout)
+    elif last_event_ts is None and ttfb_enabled and math.isfinite(ttfb_timeout):
+        deadlines.append(ttfb_timeout)
+    elif (not idle_requires_progress or last_progress_ts is not None) and idle_enabled and math.isfinite(idle_timeout):
+        deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
+    if not deadlines or min(deadlines) <= elapsed: return ""
+    return f"; auto-reconnect at {int(min(deadlines))}s"
+
+
+def _provider_wait_notice(*, model: object, elapsed: float, recovery: str = "", streaming: bool) -> str:
+    model_label = str(model or "the provider")
+    detail = "Reasoning will appear automatically if the backend streams it" if streaming else "This API returns displayable output only when its response arrives"
+    recovery_text = str(recovery or "").strip()
+    if recovery_text and not recovery_text.startswith(";"): recovery_text = "; " + recovery_text
+    return f"⏳ waiting on {model_label} — request active; no visible output after {max(0, int(elapsed))}s. {detail}{recovery_text}."
+
+
+_QUIET_WAIT_PLATFORMS = frozenset({"desktop", "tui"})
+
+
+def _surface_countdown_wait(agent, notice: str) -> None:
+    if str(getattr(agent, "platform", "") or "").lower() in _QUIET_WAIT_PLATFORMS:
+        touch = getattr(agent, "_touch_activity", None)
+        if callable(touch): touch(notice)
+        return
+    agent._emit_wait_notice(notice)
+
+
 # ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
 # A session wedged against an unresponsive provider would otherwise hit the
 # stale detector on every call forever. ``agent._consecutive_stale_streams``
@@ -741,11 +784,18 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
+    api_kwargs = _omit_empty_tools_at_wire_boundary(dict(api_kwargs))
     request_client = make_client("chat_completion_request")
     # #93650: keep the bulk wire-format payload out of the SDK's GIL-holding
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
+    # The SDK bypass deliberately creates empty typed placeholders for bulk
+    # fields before moving their real values into ``extra_body``.  Relay codecs
+    # may also materialize an absent optional tools field as ``[]``.  Normalize
+    # after that final transform as well; otherwise a prose/finalize request can
+    # still put ``tools: []`` on strict OpenAI-compatible endpoints.
+    api_kwargs = _omit_empty_tools_at_wire_boundary(api_kwargs)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1368,6 +1418,67 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
         guardrail_config=getattr(agent, "_bedrock_guardrail_config", None))
 
 
+def _commentary_gate_omits_tools(agent) -> bool:
+    """True while a commentary-gate API call is in flight."""
+    try:
+        guardrails = getattr(agent, "_tool_guardrails", None)
+        return bool(getattr(guardrails, "commentary_gate_active", lambda: False)())
+    except Exception:
+        return False
+
+
+def _apply_commentary_gate_to_tools(agent, tools_for_api):
+    """Force the tools list to be omitted while asking the model for commentary."""
+    if _commentary_gate_omits_tools(agent):
+        return []
+    if tools_for_api is None:
+        return agent.tools
+    return tools_for_api
+
+
+def _strip_tools_from_kwargs_for_commentary_gate(agent, kwargs: dict) -> dict:
+    """Prevent a transport builder from reintroducing tools during the gate."""
+    if not _commentary_gate_omits_tools(agent) or not isinstance(kwargs, dict):
+        return kwargs
+    kwargs.pop("tools", None)
+    kwargs.pop("functions", None)
+    extra = kwargs.get("extra_body")
+    if isinstance(extra, dict):
+        extra.pop("tools", None)
+        extra.pop("functions", None)
+    return kwargs
+
+
+def _omit_empty_tools_at_wire_boundary(kwargs: dict) -> dict:
+    """Never send an explicit empty tool collection to OpenAI-compatible APIs.
+
+    Request middleware runs after the normal transport builder, so a plugin or
+    late policy can remove the last tool after ``_base_kwargs`` has already
+    applied its omission rule. vLLM rejects ``tools: []`` with a non-retryable
+    400. Normalize again at the final wire boundary so every chat-completions
+    request uses the portable representation: no field at all.
+    """
+    if not isinstance(kwargs, dict):
+        return kwargs
+    extra = kwargs.get("extra_body")
+    # A non-empty value in ``extra_body`` is the SDK-transform bypass's real
+    # payload.  In that case its top-level [] is an intentional typed
+    # placeholder and is replaced by the SDK merge.  For a genuinely tool-free
+    # request both representations are empty and must be omitted.
+    extra_tools = extra.get("tools") if isinstance(extra, dict) else None
+    extra_functions = extra.get("functions") if isinstance(extra, dict) else None
+    if kwargs.get("tools") == [] and not extra_tools:
+        kwargs.pop("tools", None)
+    if kwargs.get("functions") == [] and not extra_functions:
+        kwargs.pop("functions", None)
+    if isinstance(extra, dict):
+        if extra.get("tools") == []:
+            extra.pop("tools", None)
+        if extra.get("functions") == []:
+            extra.pop("functions", None)
+    return kwargs
+
+
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     from agent.codex_responses_adapter import classify_responses_route
     from agent.native_compaction import native_compaction_context_management
@@ -1492,20 +1603,25 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     # One-shot continuation override — consumed exactly once, on the FIRST
     # request this call builds (only one api_mode branch runs per invocation).
     reasoning_config = _reasoning_config_for_wire(agent)
-    if tools_for_api is None:
-        tools_for_api = agent.tools
+    tools_for_api = _apply_commentary_gate_to_tools(agent, tools_for_api)
     # The one place request_overrides are consumed: static /fast values are already pinned
     # in agent.request_overrides; auto/cold windows layer the fast override per request.
     request_overrides = effective_request_overrides(agent)
     if agent.api_mode == "anthropic_messages":
-        return _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
+        return _strip_tools_from_kwargs_for_commentary_gate(
+            agent, _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides)
+        )
     if agent.api_mode == "bedrock_converse":
-        return _build_bedrock_kwargs(agent, api_messages, tools_for_api)
+        return _strip_tools_from_kwargs_for_commentary_gate(
+            agent, _build_bedrock_kwargs(agent, api_messages, tools_for_api)
+        )
     # Rotation-stable logical cache scope shared by every OpenAI-wire branch
     # (memoized on the agent); anthropic/bedrock above don't use it.
     cache_scope_id = _prompt_cache_scope_for_agent(agent)
     builder = _build_codex_kwargs if agent.api_mode == "codex_responses" else _build_chat_completions_kwargs
-    return builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+    return _strip_tools_from_kwargs_for_commentary_gate(
+        agent, builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+    )
 
 
 def _model_dump_safe(obj):
@@ -2895,6 +3011,7 @@ class _StreamingCall(StreamingWaitMonitor):
         return usage, finish_reason
 
     def _open_chat_stream(self, stream_kwargs: dict[str, Any]):
+        stream_kwargs = _omit_empty_tools_at_wire_boundary(dict(stream_kwargs))
         # Native Gemini rejects OpenAI's usage-streaming extension; so do strict endpoints that
         # already 4xx'd on it this session (``_stream_options_unsupported``, see #9705).
         if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
@@ -2906,6 +3023,9 @@ class _StreamingCall(StreamingWaitMonitor):
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
+        # Keep this *after* the SDK bypass.  Relay/OpenAI typed transforms can
+        # recreate an empty optional tools placeholder after the earlier guard.
+        stream_kwargs = _omit_empty_tools_at_wire_boundary(stream_kwargs)
         return request_client.chat.completions.create(**stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
@@ -3059,6 +3179,11 @@ class _StreamingCall(StreamingWaitMonitor):
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                 reasoning_parts.append(reasoning_text)
                 self._emit_reasoning(reasoning_text)
+                if _spark_stream_should_abort_ngram(self.api_kwargs, reasoning_parts, content_parts):
+                    finish_reason = FINISH_REASON_LENGTH
+                    with contextlib.suppress(Exception):
+                        stream.close()
+                    break
             # Structured reasoning_details deltas carry the provider's replay data; the
             # non-streaming path already keeps them, so dropping them here lost
             # reasoning continuity on nearly every turn. Pydantic parks unknown fields
@@ -3209,11 +3334,14 @@ class _StreamingCall(StreamingWaitMonitor):
             # Only when present: _build_assistant_message's passthrough persists them
             # for replay, and non-reasoning providers keep the attribute absent.
             message.reasoning_details = reasoning_details
+        response_dropped = ([getattr(getattr(tc, "function", None), "name", None) or "?" for tc in mock_tool_calls]
+                            if has_truncated_tool_args and mock_tool_calls else None)
         # The provider's id when the chunks carried one (chatcmpl-/gen-...): it is what a provider needs to
         # look a request up. Fabricated only when the stream never sent one.
         response = SimpleNamespace(id=response_id or ("stream-" + str(uuid.uuid4())), model=model_name, usage=usage_obj,
             provider=upstream_provider,
-            choices=[SimpleNamespace(index=0, message=message, finish_reason=effective_finish_reason)])
+            choices=[SimpleNamespace(index=0, message=message, finish_reason=effective_finish_reason)],
+            _dropped_tool_names=response_dropped)
         # A held router timeout shim (#68396) is rejected by validate_response and retried;
         # releasing its text here would show the provider failure as assistant output.
         if not is_router_timeout_shim(response):
@@ -3564,6 +3692,19 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.debug("Stale stream socket shutdown found no socket; pool sweep is the only abort")
         except Exception:
             logger.debug("Stale stream socket shutdown failed", exc_info=True)
+
+    def _kill_hard_timeout(self, elapsed: float) -> None:
+        """Abort a stream that remains busy past its wall-clock cap."""
+        limit = self._stream_hard_timeout
+        logger.warning("Stream hit wall-clock limit after %.0fs (cap %.0fs). model=%s.", elapsed, limit or 0.0, self.api_kwargs.get("model", "unknown"))
+        self.agent._buffer_status(f"⚠️ Provider stream exceeded {int(limit or elapsed)}s wall-clock (model: {self.api_kwargs.get('model', 'unknown')}). Aborting...")
+        self._request_cancelled["value"] = True
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("hard_timeout_kill")
+            self.clients.close_once("hard_timeout_kill")
+        self.result["error"] = TimeoutError(f"Provider stream exceeded wall-clock limit of {int(limit or elapsed)}s")
+        self.agent._emit_wait_notice(f"⚠ stream hit {int(limit or elapsed)}s wall-clock cap — aborting")
+        self.agent._touch_activity(f"hard timeout after {int(elapsed)}s")
 
     def _kill_stale_stream(self, elapsed: float) -> None:
         """SSE pings but no chunks: cancel the attempt and abort the request-local

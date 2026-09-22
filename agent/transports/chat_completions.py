@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.frontier_harness import apply_frontier_request_policy
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
     clamp_reasoning_config, kimi_supported_efforts, requested_effort,
@@ -30,6 +31,149 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 # normalize_response. The alias value matches _CODEX_TOOL_SEARCH_ALIAS from the Codex-side fix for the same
 # reserved-name class (#83122) so the two transports stay consistent.
 _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
+
+# Custom OpenAI-compat omits user max_tokens; Spark V4.1 with reasoning_effort=max
+# then never closes <think>. These are internal wire rails, not user caps.
+# Think budget tracks Mia DSpark (~12.5k measured). Do not send presence/
+# frequency: RejectionSampler shifts target p vs greedy DSpark q and collapses
+# accept (measured 50% → 8% → 3.6% on a live Flappy generate).
+_DSV41_SPARK_MAX_TOKENS = 32768
+_DSV41_SPARK_THINK_BUDGET = 12288
+_DSV41_SPARK_CONTENT_RESERVE = 8192
+_DSV41_SPARK_TOP_P = 0.95
+_DSV41_SPARK_TEMPERATURE = 0.3
+_DSV41_SPARK_NGRAM = {
+    "max_pattern_size": 24,
+    "min_pattern_size": 4,
+    "min_count": 4,
+}
+_DSV41_SPARK_OFFICIAL_HOSTS = {"api.deepseek.com", "api.deepseek.ai"}
+
+
+def _is_dsv41_spark_vllm(model: str, base_url: Any) -> bool:
+    """True for the live Spark EXL3 overlay, never api.deepseek.com."""
+    model_l = (model or "").lower()
+    if "v4.1-flash" not in model_l and "v4.1_flash" not in model_l:
+        return False
+    try:
+        host = (urlparse(str(base_url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    return host not in _DSV41_SPARK_OFFICIAL_HOSTS
+
+
+def _apply_dsv41_spark_vllm_kwargs(
+    api_kwargs: dict[str, Any],
+    *,
+    model: str,
+    reasoning_config: dict | None,
+    params: dict,
+) -> None:
+    """GLM-class rails for DeepSeek-V4.1-Flash on custom vLLM/Spark.
+
+    Hermes dropped user output caps, so config max_tokens never reaches the
+    overlay. ``reasoning_effort=max`` then fills an uncapped think stream;
+    DSpark 100%-accepts a greedy n-gram. Force max_tokens, thinking_token_budget
+    (closes with </think>), repetition_detection (4-token / count 4), nucleus
+    top_p, and non-greedy temperature. Strip presence/frequency even if config
+    extra_body still has them — they kill DSpark accept vs Mia. Do not send
+    client stop strings — they fire inside <think> (Tony/Mia). Do not raise
+    classic repetition_penalty (Unsloth/QwQ).
+    """
+    base_url = params.get("base_url")
+    if not _is_dsv41_spark_vllm(model, base_url):
+        return
+    thinking_off = isinstance(reasoning_config, dict) and (
+        reasoning_config.get("enabled") is False or requested_effort(reasoning_config) == "none"
+    )
+    extra = api_kwargs.get("extra_body")
+    if not isinstance(extra, dict):
+        extra = {}
+        api_kwargs["extra_body"] = extra
+    extra.pop("stop", None)
+    api_kwargs.pop("stop", None)
+    api_kwargs.pop("presence_penalty", None)
+    api_kwargs.pop("frequency_penalty", None)
+    extra.pop("presence_penalty", None)
+    extra.pop("frequency_penalty", None)
+
+    max_tokens_fn = params.get("max_tokens_param_fn") or (lambda value: {"max_tokens": value})
+    think_budget = _DSV41_SPARK_THINK_BUDGET if not thinking_off else 0
+    floor = (think_budget + _DSV41_SPARK_CONTENT_RESERVE) if think_budget else 1
+    ceiling = _DSV41_SPARK_MAX_TOKENS
+    current = None
+    for key in ("max_tokens", "max_completion_tokens"):
+        raw = api_kwargs.get(key)
+        if raw is not None:
+            try:
+                current = int(raw)
+            except (TypeError, ValueError):
+                current = None
+            break
+    target = ceiling if current is None else max(floor, min(current, ceiling))
+    api_kwargs.update(max_tokens_fn(target))
+
+    try:
+        raw_temp = api_kwargs.get("temperature")
+        if raw_temp is None:
+            raw_temp = params.get("temperature")
+        temp = float(raw_temp) if raw_temp is not None else None
+    except (TypeError, ValueError):
+        temp = None
+    if temp is None or temp <= 0:
+        api_kwargs["temperature"] = _DSV41_SPARK_TEMPERATURE
+    api_kwargs.setdefault("top_p", _DSV41_SPARK_TOP_P)
+    extra.setdefault("repetition_detection", dict(_DSV41_SPARK_NGRAM))
+    ctk = extra.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+        extra["chat_template_kwargs"] = ctk
+    if thinking_off:
+        # Config extra_body still has thinking max + budget. Length continuations
+        # set reasoning off so think cannot re-burn the cap; strip those keys or
+        # four thinking-only length hits become "truncated after 4 continuations".
+        extra.pop("thinking_token_budget", None)
+        extra.pop("reasoning", None)
+        ctk["thinking"] = False
+        ctk["enable_thinking"] = False
+        ctk.pop("reasoning_effort", None)
+        return
+    extra["thinking_token_budget"] = _DSV41_SPARK_THINK_BUDGET
+    ctk["thinking"] = True
+    ctk["enable_thinking"] = True
+
+
+def _apply_glm53_vllm_reasoning_kwargs(
+    api_kwargs: dict[str, Any],
+    *,
+    model: str,
+    reasoning_config: dict | None,
+) -> None:
+    """Send Spark/vLLM GLM-5.3 reasoning through chat_template_kwargs.
+
+    Custom (non-OpenRouter) routes skip extra_body.reasoning, so the GLM
+    jinja template defaults reasoning_effort to max and every tiny tool
+    call thinks for minutes. The live Spark template only honors ``low``
+    and ``high``; any other value (including ``medium``) becomes max.
+    """
+    model_l = (model or "").lower()
+    if "glm-5.3" not in model_l and "glm53" not in model_l:
+        return
+    effort = requested_effort(reasoning_config)
+    if not effort:
+        return
+    if effort == "medium":
+        effort = "high"
+    extra = api_kwargs.get("extra_body")
+    if not isinstance(extra, dict):
+        extra = {}
+        api_kwargs["extra_body"] = extra
+    ctk = extra.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+        extra["chat_template_kwargs"] = ctk
+    ctk.setdefault("enable_thinking", True)
+    ctk["reasoning_effort"] = effort
 
 # Persistence-only / cross-transport message keys that strict OpenAI-compatible
 # providers reject with HTTP 400 ("Extra inputs are not permitted").
@@ -364,7 +508,23 @@ def _base_kwargs(model: str, sanitized: list, tools: Any, params: dict, profile:
 
 
 def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *, supports_prompt_cache_key: bool) -> dict[str, Any]:
-    """Tail shared by both build paths: content-addressed prompt_cache_key, then return."""
+    """Tail shared by both build paths: frontier policy, GLM reasoning, then prompt_cache_key."""
+    apply_frontier_request_policy(
+        api_kwargs,
+        model=params.get("model") or api_kwargs.get("model") or "",
+        params=params,
+    )
+    _apply_glm53_vllm_reasoning_kwargs(
+        api_kwargs,
+        model=str(params.get("model") or api_kwargs.get("model") or ""),
+        reasoning_config=params.get("reasoning_config"),
+    )
+    _apply_dsv41_spark_vllm_kwargs(
+        api_kwargs,
+        model=str(params.get("model") or api_kwargs.get("model") or ""),
+        reasoning_config=params.get("reasoning_config"),
+        params=params,
+    )
     _add_prompt_cache_key(
         api_kwargs, messages=sanitized, tools=api_kwargs.get("tools"), supports_prompt_cache_key=supports_prompt_cache_key,
         session_id=params.get("session_id"), cache_scope_id=params.get("cache_scope_id"),

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.error_classifier import FailoverReason
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
-from agent.repetition_guard import is_repetition_dominated
+from agent.repetition_guard import is_repetition_dominated, should_abort_ngram_loop
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
@@ -193,7 +193,7 @@ def _abort_reason(agent: Any, content: Any, has_tool_calls: bool) -> Optional[tu
     if content and _THINK_TAG_RE.search(content) and not agent._has_content_after_think_block(content):
         return _THINKING_EXHAUSTED
     visible = agent._strip_think_blocks(content) if isinstance(content, str) else content
-    if visible and is_repetition_dominated(visible):
+    if visible and (is_repetition_dominated(visible) or should_abort_ngram_loop(visible)):
         return _REPETITION_DOMINATED
     return None
 
@@ -250,8 +250,10 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     st.length_continue_retries += 1
     n = st.length_continue_retries
     _interim_content = getattr(assistant_message, "content", None)
-    if not _interim_content and not st.is_stub:
+    _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
+    if (not _interim_content and not st.is_stub) or _dropped_tools:
         # Thinking-only truncation: continuing with thinking ON re-burns the budget.
+        # Dropped write_file JSON is the same trap — think must not refill the cap.
         agent._ephemeral_reasoning_off = True
     if _interim_content:
         interim_msg = agent._build_assistant_message(assistant_message, st.finish_reason)
@@ -261,7 +263,6 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
 
     filled = st.window_filled
     if n < 4 and filled is None:
-        _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "

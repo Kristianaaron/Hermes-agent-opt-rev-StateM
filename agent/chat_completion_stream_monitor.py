@@ -84,6 +84,14 @@ class StreamingWaitMonitor:
                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.
                 self._mon.wait_notice.reset()
                 self._kill_stale_stream(_stale_elapsed)
+            hard = getattr(self, "_stream_hard_timeout", None)
+            started = getattr(self, "started_at", None)
+            if hard is not None and started is not None and hard > 0 and (_hb_now - started) > hard:
+                self._mon.wait_notice_started_ts = None
+                killer = getattr(self, "_kill_hard_timeout", None)
+                if callable(killer):
+                    killer(_hb_now - started)
+                    return
             if self.agent._interrupt_requested:
                 self._abort_for_interrupt(_stale_elapsed)
                 return

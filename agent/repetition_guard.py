@@ -34,6 +34,40 @@ REPETITION_LOOP_INTERRUPTED = "[the reply degenerated into a repetition loop and
 _RUNAWAY_DISTINCT_LINE_RATIO = 0.5
 
 
+# Client n-gram abort: character window stays 24 so indent/HTML tags do not
+# false-positive. min_count 4 trips earlier than 8×24; engine token n-grams
+# use min_pattern_size 4 / min_count 4 separately.
+SPARK_NGRAM_WINDOW = 24
+SPARK_NGRAM_MIN_COUNT = 4
+
+
+def should_abort_ngram_loop(
+    text: str, *, window: int = SPARK_NGRAM_WINDOW, min_count: int = SPARK_NGRAM_MIN_COUNT, tail: int = 2048,
+) -> bool:
+    """True when a short n-gram is echoing in the recent stream (Spark think-loop).
+
+    Cheaper and earlier than :func:`is_repetition_dominated`, which waits for a
+    400-char fragment. DSpark 100%-accepts draft n-grams, so this has to fire
+    while tokens are still flowing.
+    """
+    if not isinstance(text, str):
+        return False
+    if len(text) >= MIN_FRAGMENT_LENGTH and is_repetition_dominated(text):
+        return True
+    sample = text[-tail:] if len(text) > tail else text
+    n = len(sample)
+    if n < window * min_count:
+        return False
+    counts: dict[str, int] = {}
+    for i in range(n - window + 1):
+        key = sample[i : i + window]
+        c = counts.get(key, 0) + 1
+        if c >= min_count:
+            return True
+        counts[key] = c
+    return False
+
+
 def is_repetition_dominated(text: str) -> bool:
     """True when a single 60+ char substring recurs often enough to cover at least half
     of ``text`` — the signature of a repetition loop. Fail-open for non-string/short input.

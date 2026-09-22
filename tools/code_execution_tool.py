@@ -723,6 +723,56 @@ def execute_code(
                 "it could complete (SIGTERM propagates to child processes). "
                 "Run the lifecycle command from a shell outside the gateway."
             )
+
+    def _fixed_anc_node_timeout_hint(code: str) -> Optional[str]:
+        """Reject the known nested Node timeout anti-pattern without regex guessing.
+
+        The historic failure used ``subprocess.run(["node", "/tmp/anc.js"],
+        timeout=45)`` inside execute_code. The inner deadline fires before Hermes'
+        outer sandbox budget and surfaces a long traceback. Only literal numeric
+        timeouts on a literal ``/tmp/anc.js`` subprocess call are rejected.
+        """
+        try:
+            import ast
+            tree = ast.parse(code)
+        except (SyntaxError, TypeError, ValueError):
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            owner = node.func.value
+            if not (
+                isinstance(owner, ast.Name)
+                and owner.id == "subprocess"
+                and node.func.attr in {"run", "check_call", "check_output"}
+                and node.args
+            ):
+                continue
+            has_anc = any(
+                isinstance(part, ast.Constant)
+                and isinstance(part.value, str)
+                and part.value == "/tmp/anc.js"
+                for part in ast.walk(node.args[0])
+            )
+            if not has_anc:
+                continue
+            timeout = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
+            if (
+                isinstance(timeout, ast.Constant)
+                and isinstance(timeout.value, (int, float))
+                and not isinstance(timeout.value, bool)
+                and timeout.value > 0
+            ):
+                return (
+                    f"Fixed timeout={timeout.value:g}s on /tmp/anc.js is blocked because "
+                    "it can terminate healthy work before Hermes' execute_code deadline. "
+                    "Omit the nested timeout and rely on execute_code's outer budget."
+                )
+        return None
+
+    fixed_timeout_hint = _fixed_anc_node_timeout_hint(code)
+    if fixed_timeout_hint:
+        return tool_error(fixed_timeout_hint)
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]

@@ -320,6 +320,7 @@ function ModelResults({
               const isCurrent = model === currentModel && catalogProviderMatches(provider, currentProvider)
               const price = provider.pricing?.[model]
               const locked = unavailable.has(model)
+              const displayModel = modelDisplayLabel(provider, model)
               // Managed local model loading into memory right now: show the
               // real load percent inline (keyed by exact model id — remote
               // providers never match).
@@ -343,7 +344,7 @@ function ModelResults({
                   value={`${provider.slug}:${model}`}
                 >
                   <span className="min-w-0 flex-1 truncate">
-                    <HighlightMatches foldSeparators query={search} text={model} />
+                    <HighlightMatches foldSeparators query={search} text={displayModel} />
                   </span>
                   {loadProgress && (
                     <span className="flex shrink-0 items-center gap-1.5" title={copy.loadingIntoMemory}>
@@ -487,6 +488,13 @@ function ModelPrice({ price, isCurrent }: { price?: ModelPricing; isCurrent: boo
       ) : null}
     </span>
   )
+}
+
+function modelDisplayLabel(provider: ModelOptionProvider, model: string): string {
+  const identity = `${provider.slug} ${provider.name}`.toLowerCase()
+  if (identity.includes('adaptive')) return `${model} · Adaptive`
+  if (identity.includes('high reasoning')) return `${model} · High reasoning`
+  return model
 }
 
 function LoadingResults() {

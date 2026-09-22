@@ -66,6 +66,9 @@ def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monke
     final = _terminal_empty(agent, SimpleNamespace(), "stop", messages)
     assert bool(sent) is enabled
     assert messages[-1]["_empty_terminal_sentinel"] is True
+    assert messages[-1]["content"] == "(empty)"
+    assert final.startswith("⚠️ No reply:")
+    assert final != "(empty)"
     assert "Empty response" in caplog.text
     result = {"final_response": final, "messages": messages, "failed": True}
     response, silent, _ = asyncio.run(gateway._hmwa_shape_agent_response(

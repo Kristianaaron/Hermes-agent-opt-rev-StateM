@@ -194,6 +194,25 @@ def assemble_api_request(
     # the canonical tool registry stays undecorated. Marked ``content`` becomes text
     # blocks the whitespace pass skips, so the same row's bytes vary across turns.
     tools_for_api = agent.tools
+    try:
+        _guardrails = getattr(agent, "_tool_guardrails", None)
+        _begin_gate = getattr(_guardrails, "begin_commentary_request", None)
+        if callable(_begin_gate) and _begin_gate():
+            # Codex commentary gate: omit tools so the model can only emit visible text.
+            # Use [] not None: build_api_kwargs treats None as "default to agent.tools",
+            # which would restore the registry and make the gate a no-op. The chat
+            # completions transport skips a falsy tools list, so [] never becomes
+            # ``"tools": []`` on the wire (some OpenAI-compatible servers treat an
+            # empty array as "tools present").
+            tools_for_api = []
+            logger.info(
+                "Commentary gate: omitting tools for mid-turn status "
+                "(session=%s streak=%s)",
+                getattr(agent, "session_id", None) or "none",
+                getattr(_guardrails, "tool_only_streak", "?"),
+            )
+    except Exception:
+        logger.debug("Commentary gate tool omission failed", exc_info=True)
     if agent._use_prompt_caching and agent.provider != "moa":
         from agent.prompt_caching import envelope_tool_part_cache_markers_supported
 
@@ -219,6 +238,13 @@ def assemble_api_request(
         )
         api_messages = _initial_cache_plan.messages
         tools_for_api = _initial_cache_plan.tools
+        # Prompt-cache planning must not reintroduce tools on a commentary-gate call.
+        try:
+            _guardrails = getattr(agent, "_tool_guardrails", None)
+            if getattr(_guardrails, "commentary_gate_active", lambda: False)():
+                tools_for_api = []
+        except Exception:
+            logger.debug("Commentary gate post-cache tool strip failed", exc_info=True)
 
     # Prepare the persistent-MoA request before measuring compression pressure: the
     # ephemeral advisor output is absent from ``messages``; ``create()`` reuses the

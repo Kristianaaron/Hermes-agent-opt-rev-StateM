@@ -18,6 +18,21 @@ def _make_registry(captured: dict):
 
 class TestSessionIdForwarding:
 
+    def test_standard_path_forwards_progress_callback(self):
+        """The host UI callback reaches the registry without becoming global state."""
+        captured = {}
+        callback = object()
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                tool_progress_callback=callback,
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("tool_progress_callback") is callback
+
     def test_standard_path_forwards_session_id(self):
         """registry.dispatch receives session_id on the normal tool path."""
         captured = {}

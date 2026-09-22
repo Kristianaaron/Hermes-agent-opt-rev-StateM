@@ -1260,12 +1260,25 @@ class AIAgent(
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
-        # Shown to the user as the reply, so no decision codes; the code stays in result["guardrail"].
+        # Shown to the user as the reply, so keep it factual and self-contained.
+        # Never tell the user to send ``continue``: that merely restarts the same
+        # failure path and makes a harness defect look like a missing instruction.
+        if decision.code == "read_only_streak_halt":
+            return (
+                "I didn't complete the requested change. I inspected the workspace repeatedly "
+                "without making an edit, so Hermes stopped the loop. No additional action was "
+                "taken; the harness needs a different execution path, not another `continue`."
+            )
+        if decision.code == "total_tool_call_cap":
+            return (
+                "I didn't complete the request before reaching the bounded action limit. "
+                "Hermes stopped the turn to prevent an open-ended loop; retrying unchanged "
+                "would not be useful."
+            )
         return (
-            f"I stopped retrying because I kept running {decision.tool_name or 'the same tool'} "
-            f"{decision.count} times without making progress. The last result above shows what "
-            "blocked it. Tell me how you'd like to proceed, or send `continue` and I'll try a "
-            "different approach."
+            f"I couldn't complete the request because {decision.tool_name or 'a tool path'} "
+            f"stopped making progress after {decision.count} attempts. Hermes ended the turn "
+            "instead of repeating the same approach."
         )
 
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,

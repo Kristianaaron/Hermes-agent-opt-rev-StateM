@@ -91,6 +91,51 @@ def test_bulk_fields_ride_in_extra_body_and_the_wire_bytes_are_identical():
     assert recorder.send(moved) == recorder.send(dict(body))
 
 
+def test_post_bypass_guard_omits_a_genuinely_empty_tools_field():
+    """Relay/SDK normalization may recreate ``tools=[]`` after request middleware.
+
+    The final wire guard must distinguish that from the typed placeholder whose
+    non-empty value lives in ``extra_body``.
+    """
+    from agent.chat_completion_helpers import _omit_empty_tools_at_wire_boundary
+
+    recorder = _Recorder()
+    body = {"model": "m", "messages": [{"role": "user", "content": "done"}], "tools": []}
+
+    moved = bypass_chat_sdk_request_transform(dict(body), recorder.client)
+    guarded = _omit_empty_tools_at_wire_boundary(moved)
+
+    assert "tools" not in guarded
+    assert "tools" not in guarded["extra_body"]
+    assert b'"tools"' not in recorder.send(guarded)
+
+
+def test_post_bypass_guard_preserves_nonempty_tools_in_extra_body():
+    from agent.chat_completion_helpers import _omit_empty_tools_at_wire_boundary
+
+    recorder = _Recorder()
+    body = _wire_body()
+
+    moved = bypass_chat_sdk_request_transform(dict(body), recorder.client)
+    guarded = _omit_empty_tools_at_wire_boundary(moved)
+
+    assert guarded["tools"] == []
+    assert guarded["extra_body"]["tools"] == body["tools"]
+    assert recorder.send(guarded) == recorder.send(dict(body))
+
+
+def test_bypass_itself_omits_empty_tools_for_auxiliary_paths():
+    """Every SDK bypass caller is safe, including callers without the main-loop wire guard."""
+    recorder = _Recorder()
+    body = {"model": "m", "messages": [{"role": "user", "content": "done"}], "tools": []}
+
+    moved = bypass_chat_sdk_request_transform(dict(body), recorder.client)
+
+    assert "tools" not in moved
+    assert "tools" not in moved.get("extra_body", {})
+    assert b'"tools"' not in recorder.send(moved)
+
+
 def test_escape_hatch_and_non_sdk_facades_keep_the_typed_path(monkeypatch):
     """Both rails hand the kwargs back untouched: the env hatch, and a chat-shaped facade
     that is not the SDK (MoA aggregator, test stand-ins) — it never merges ``extra_body``."""

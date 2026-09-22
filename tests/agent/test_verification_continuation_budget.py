@@ -124,6 +124,36 @@ def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypa
     agent._handle_max_iterations.assert_called_once()
 
 
+def test_intermediate_ack_control_prompt_is_hidden_from_chat(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    agent.valid_tool_names = ["web_search"]
+    agent._intent_ack_continuation = True
+    agent._looks_like_codex_intermediate_ack = MagicMock(side_effect=[True, False])
+    answers = iter([
+        _response("I'll inspect the files now"),
+        _response("The inspection is complete."),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("inspect /tmp/project")
+
+    control_rows = [
+        message
+        for message in result["messages"]
+        if message.get("role") == "user"
+        and str(message.get("content") or "").startswith("[System: Continue now")
+    ]
+    assert len(control_rows) == 1
+    assert control_rows[0]["display_kind"] == "hidden"
+    assert result["final_response"] == "The inspection is complete."
+
+
 def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent.max_iterations = 2
     agent.iteration_budget.max_total = 2

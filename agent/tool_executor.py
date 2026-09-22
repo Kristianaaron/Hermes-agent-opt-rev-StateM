@@ -451,6 +451,11 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
     if parse_error is None:
+        from agent.tool_argument_normalization import normalize_tool_arguments
+
+        args, normalized = normalize_tool_arguments(name, args)
+        if normalized:
+            logger.info("normalized model-emitted arguments for tool %s", name)
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
@@ -812,6 +817,21 @@ def _resolve_sequential_tool_timeout() -> float | None:
     return resolve_timeout("tools.sequential_call", default=_resolve_concurrent_tool_timeout())
 
 
+def _resolve_registered_tool_timeout(function_name: str, function_args: dict[str, Any], default: float | None) -> float | None:
+    try:
+        from agent.deadline import clamp_timeout
+        from tools.registry import registry
+        entry = registry.get_entry(function_name)
+        configured = getattr(entry, "execution_timeout_seconds", None)
+        if configured is None:
+            return default
+        value = configured(function_args) if callable(configured) else configured
+        return clamp_timeout(value)
+    except Exception:
+        logger.warning("registered timeout resolver failed for %s; using generic deadline", function_name, exc_info=True)
+        return default
+
+
 # Tools whose call blocks on a long-running operation that supervises its own liveness: no generic
 # sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by design
 # (children carry heartbeats, the stale monitor, and ``delegation.child_timeout_seconds``); under the
@@ -871,7 +891,8 @@ def _run_sequential_tool_execution_middleware(
     generic deadline would report ``tool_timeout`` while the prompt is still live. They
     are ``_NEVER_PARALLEL_TOOLS`` and run inline below, before any deadline is armed, so
     they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
-    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
+    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_registered_tool_timeout(
+        function_name, function_args, _resolve_sequential_tool_timeout())
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
     from agent.terminal_approval_batch import take_prepared_call

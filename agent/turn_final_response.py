@@ -24,6 +24,15 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+def _latest_user_is_empty_recovery(messages: Any) -> bool:
+    """An empty-response recovery must not recursively trigger the stall guard."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        return bool(message.get("_empty_recovery_synthetic"))
+    return False
+
+
 @dataclass
 class FinalResponseVerdict:
     """``action``: ``"break"`` (turn ends with ``final_response``), ``"continue"`` (a
@@ -108,6 +117,15 @@ def finish_text_response(
 
     # Think-block-only / empty content: recovery path.
     if not agent._has_content_after_think_block(final_response):
+        # Commentary-gate call returned empty: re-arm tools-off for the retry and
+        # do not treat this as a normal final-text miss.
+        try:
+            _guardrails = getattr(agent, "_tool_guardrails", None)
+            _finish_gate = getattr(_guardrails, "finish_commentary_request", None)
+            if callable(_finish_gate):
+                _finish_gate(has_visible_text=False)
+        except Exception:
+            logger.debug("Commentary gate empty-response re-arm failed", exc_info=True)
         _ev = recover_empty_response(
             agent, assistant_message, response, finish_reason, final_response=final_response,
             messages=messages, api_messages=api_messages, conversation_history=conversation_history,
@@ -132,6 +150,27 @@ def finish_text_response(
     agent._emit_pending_fallback_notice()
     agent._clear_status_buffer()
 
+    # Codex commentary gate: tools were omitted so this text is mid-turn status, not
+    # final_answer. Stream it, reset the mute streak, restore tools on the next call.
+    try:
+        _guardrails = getattr(agent, "_tool_guardrails", None)
+        _finish_gate = getattr(_guardrails, "finish_commentary_request", None)
+        _visible_for_gate = agent._strip_think_blocks(final_response or "").strip()
+        if callable(_finish_gate) and _finish_gate(has_visible_text=bool(_visible_for_gate)):
+            interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+            append_message(messages, interim_msg)
+            agent._emit_interim_assistant_message(interim_msg)
+            agent._session_messages = messages
+            final_response = None
+            logger.info(
+                "Commentary gate: mid-turn status delivered; continuing with tools "
+                "(session=%s)",
+                getattr(agent, "session_id", None) or "none",
+            )
+            return _verdict("continue")
+    except Exception:
+        logger.debug("Commentary gate finish path failed", exc_info=True)
+
     # Defensive: repair malformed role-alternation before API call. Catches cases where the history got
     # wedged into a ``tool → user`` or ``user → user`` tail (e.g. after empty- response scaffolding was
     # stripped and a new user message landed after an orphan tool result). Most providers return empty
@@ -155,13 +194,20 @@ def finish_text_response(
     # stalled model, and returning it as the answer aborts the tool loop while reporting
     # "complete" (#111761). Same cap, so a model that never acts still ends after 2 nudges.
     _stall_text = agent._strip_think_blocks(final_response or "")
+    _promoted_plan = bool(_promoted) and promoted_reasoning_announces_action(_stall_text)
     _stall_continue_intent = (
         bool(getattr(agent, "_stall_guards", True))
         and agent.valid_tool_names
         and codex_ack_continuations < 2
         and (
-            trailing_continue_intent(_stall_text)
-            or (bool(_promoted) and promoted_reasoning_announces_action(_stall_text))
+            (
+                not _latest_user_is_empty_recovery(messages)
+                and trailing_continue_intent(_stall_text)
+            )
+            # Empty-recovery recursion is suppressed for ordinary text, but a
+            # reasoning-only response that still ends in a plan is not a final
+            # answer. Keep the bounded guard active so tools can be restored.
+            or _promoted_plan
         )
     )
     # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
@@ -219,6 +265,10 @@ def finish_text_response(
                 _DEGENERATE_FINAL_NUDGE if _continuation_kind == "degenerate"
                 else _CODEX_ACK_CONTINUATION_NUDGE
             ),
+            # Internal control flow, not a human-authored chat row. Keep it on
+            # the model transcript while ensuring live and rehydrated UIs never
+            # render it as a user message.
+            "display_kind": "hidden",
         })
         agent._session_messages = messages
         # An acknowledgment is non-final: its text must not suppress iteration-limit
