@@ -1,5 +1,5 @@
 name: gliner-extract
-version: "1.0.0"
+version: "1.1.0"
 description: "Pre-warmed GLiNER semantic evidence for update-safe GLM System-1 routing."
 author: "Kristian Aaron"
 kind: standalone

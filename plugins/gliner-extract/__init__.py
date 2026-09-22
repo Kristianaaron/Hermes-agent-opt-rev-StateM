@@ -8,12 +8,18 @@ state before selecting a fast or full execution lane.
 The model is pre-warmed in the background. Classification is cached, bounded by
 a short timeout, and fail-open: GLiNER can improve routing but can never prevent a
 normal Hermes request from reaching the model.
+
+Hermes gives every ``llm_request`` middleware the same original request and keeps
+the last returned payload, so this plugin never returns a request: echoing one
+would silently discard the router's lane decision whenever this plugin happens to
+load after it. The router pulls evidence directly through :func:`classify`.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -28,6 +34,16 @@ _MODEL_LOADING = False
 _MODEL_LOCK = threading.Lock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-gliner")
 _BUSY_UNTIL = 0.0
+# A timed-out prediction keeps running on the single worker. New requests must not
+# queue behind it and pay the full timeout again, so they skip until it finishes.
+_INFLIGHT = None
+_INFLIGHT_LOCK = threading.Lock()
+# A missing dependency or model download failure is not retried on every request.
+_LOAD_FAILED_UNTIL = 0.0
+_LOAD_RETRY_SECONDS = 300.0
+_GLM = ("glm-5.3", "glm53")
+# Stable alias so the router finds this module regardless of the loader's name.
+ALIAS = "hermes_gliner_extract"
 _EVIDENCE: ContextVar[dict[str, Any] | None] = ContextVar(
     "hermes_gliner_evidence", default=None
 )
@@ -150,7 +166,7 @@ def _enabled() -> bool:
 
 
 def _load_model():
-    global _MODEL, _MODEL_LOADING
+    global _MODEL, _MODEL_LOADING, _LOAD_FAILED_UNTIL
     if _MODEL is not None:
         return _MODEL
     with _MODEL_LOCK:
@@ -170,8 +186,12 @@ def _load_model():
             # classifier latency rather than a one-off timeout.
             model.predict_entities("warmup", list(_LABELS), threshold=0.99)
             _MODEL = model
+            _LOAD_FAILED_UNTIL = 0.0
             logger.info("GLiNER ready: %s", _model_name())
             return _MODEL
+        except Exception:
+            _LOAD_FAILED_UNTIL = time.monotonic() + _LOAD_RETRY_SECONDS
+            raise
         finally:
             _MODEL_LOADING = False
 
@@ -380,12 +400,25 @@ def _extract(text: str) -> dict[str, Any]:
     return evidence
 
 
+def _is_glm(model: str) -> bool:
+    lowered = (model or "").lower()
+    return any(token in lowered for token in _GLM)
+
+
 def _signal(text: str) -> dict[str, Any] | None:
-    global _BUSY_UNTIL
+    global _BUSY_UNTIL, _INFLIGHT
+    # Cache hits never touch the worker, so repeated tool hops in one turn are free
+    # even while an unrelated prediction is still running.
+    cached = _cache_get(text)
+    if cached is not None:
+        return cached
     now = time.monotonic()
-    if now < _BUSY_UNTIL or _MODEL_LOADING:
+    if now < _BUSY_UNTIL or now < _LOAD_FAILED_UNTIL or _MODEL_LOADING:
         return None
-    future = _EXECUTOR.submit(_extract, text)
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT is not None and not _INFLIGHT.done():
+            return None
+        future = _INFLIGHT = _EXECUTOR.submit(_extract, text)
     try:
         return future.result(timeout=_timeout_seconds())
     except FutureTimeout:
@@ -408,41 +441,50 @@ def consume_evidence() -> dict[str, Any] | None:
     return evidence
 
 
+def classify(text: str) -> dict[str, Any] | None:
+    """Return routing evidence for user-authored ``text``, or None (fail-open).
+
+    This is the router's direct entry point. It does not depend on middleware
+    order, and cached text returns without waiting on the worker.
+    """
+    if not _enabled():
+        return None
+    text = _strip_attached_context(str(text or ""))
+    if not _should_probe(text):
+        return None
+    evidence = _signal(text)
+    if evidence is not None and not evidence.get("cached"):
+        logger.info(
+            "gliner-route: decision=%s category=%s confidence=%.3f latency_ms=%.1f",
+            evidence["decision"],
+            evidence["category"],
+            evidence["confidence"],
+            evidence["latency_ms"],
+        )
+    return evidence
+
+
 def on_llm_request(**kwargs: Any):
     _EVIDENCE.set(None)
     request = kwargs.get("request")
     model = str(kwargs.get("model") or (request or {}).get("model") or "")
-    if not isinstance(request, dict) or not _enabled() or "glm-5.3" not in model.lower():
+    if not isinstance(request, dict) or not _is_glm(model):
         return None
     messages = request.get("messages")
     if not isinstance(messages, list):
         messages = request.get("input")
-    text = _latest_user_text(messages or [])
-    if not _should_probe(text):
-        return None
-    evidence = _signal(text)
-    if evidence is None:
-        return None
-    _EVIDENCE.set(evidence)
-    logger.info(
-        "gliner-route: decision=%s category=%s confidence=%.3f latency_ms=%.1f cached=%s",
-        evidence["decision"],
-        evidence["category"],
-        evidence["confidence"],
-        evidence["latency_ms"],
-        evidence["cached"],
-    )
-    # Evidence remains process-local and never enters the provider payload.
-    return {
-        "request": dict(request),
-        "source": "gliner-extract",
-        "reason": f"{evidence['decision']}:{evidence['category']}",
-    }
+    evidence = classify(_latest_user_text(messages or []))
+    if evidence is not None:
+        _EVIDENCE.set(evidence)
+    # Never return a request: Hermes keeps the last middleware payload, and an
+    # echo of the original would overwrite the router's lane decision.
+    return None
 
 
 def register(ctx) -> None:
     global _CTX
     _CTX = ctx
+    sys.modules[ALIAS] = sys.modules[__name__]
     ctx.register_middleware("llm_request", on_llm_request)
     if _enabled() and bool(_setting("prewarm", True)):
         threading.Thread(target=_prewarm, name="hermes-gliner-prewarm", daemon=True).start()

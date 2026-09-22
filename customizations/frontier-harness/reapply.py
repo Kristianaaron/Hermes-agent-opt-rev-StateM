@@ -56,7 +56,7 @@ CONFIG_INVARIANTS = (
     "platform_toolsets:",
     "statem_mcp_server.py",
     "fail_closed_when_active: true",
-    "stale_timeout_seconds: 21600",
+    "hard_timeout_seconds:",
     "context_length: 1048576",
     "context_timeout_seconds: 1800",
 )

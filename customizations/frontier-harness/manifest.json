@@ -1,6 +1,6 @@
 {
   "config_snapshot_sha256": "6efa2ecfe7be7d4d3e2276876f7c30e752e705f739c6380e10d2be69edfdf610",
-  "controller_sha256": "8994deacd540f014c07b5e1572cecfda84eaf1a35e6c919740df4ba40a065fa7",
+  "controller_sha256": "e2459be50b2d503db80c0432988bb94c96ac5773cc99a7d4069ba4ef9b0a0b39",
   "explicitly_excluded_as_stale_or_superseded": [
     "agent/tool_guardrails.py-e accidental editor artifact",
     "older repeated-batch and state-generation guardrail patches",
@@ -26,12 +26,12 @@
     "$HOME/Library/LaunchAgents/ai.hermes.customizations.plist"
   ],
   "gateway_entrypoint_sha256": "802d0997b230efe152c79ac8507164326b86b08f4f02f50676fad4230d1cc3bb",
-  "gliner_extract_sha256": "5da02d92837bd22758b43f9cf7dc8ef501d4281b91844a604aa3d1beca95d1b0",
-  "glm_system1_router_sha256": "f8cbf1d059d10969bd6c2b136d0ca8579721d8e2e7027a6634c253b045f7b479",
+  "gliner_extract_sha256": "6f088aa751bfcf0f176dd74a5ced87186f36b0d3448eba6cad9263a91bbc7856",
+  "glm_system1_router_sha256": "63aa3ecbf100cf8f910bde01c56960c2df28525a215cd2a87d7cdf1b0ff35fca",
   "hermes_upstream_commit": "bc655bfb40ff7414bbec9dd179b17cf41e2f60ba",
   "hermes_upstream_version": "0.21.3",
   "name": "Hermes Desktop model-agnostic frontier harness",
-  "overlay_sha256": "efe6d132bd83790ed94d251d4752091b044156cb26eba6922af7dffee748070f",
+  "overlay_sha256": "ded3e0d51056467f10b59fb0d0426d4dc40148fd5ac7c8f04162583a423af4c4",
   "owned_source_files": [
     "agent/chat_completion_helpers.py",
     "agent/chat_completion_nonstream.py",
@@ -116,7 +116,9 @@
     "nested and aliased tool argument normalization",
     "pre-warmed GLiNER semantic System-1 routing with compact context and bounded tools",
     "attached URL/file context excluded from GLiNER classification while remaining available to the model",
-    "bounded-edit inspect-to-act gating with compact first-failure recovery and forced completion budgets",
+    "bounded-edit inspect-to-act gating with compact first-failure recovery and escalate-then-finalize budgets",
+    "order-independent GLiNER evidence pull with in-flight skip and load-failure backoff",
+    "provider hard_timeout_seconds wired into the streaming wall-clock watchdog",
     "contextual retry/continue inheritance with fresh-turn failure isolation and bounded completion budgets",
     "structured tool-result failure classification that ignores error vocabulary in successful output",
     "System-1 cross-turn trace elision that retains only conversational endpoints when continuity is required",
@@ -161,5 +163,5 @@
     "https://openrouter.ai/docs/guides/features/response-caching"
   ],
   "schema_version": 9,
-  "verifier_sha256": "8ac819ab2eec85042f0c46a88aa6cf2b04cf0a6eb4948bba0d3c6846438cafa4"
+  "verifier_sha256": "b886b20b8129747216f13427281643178e1850c9d76a23c7ec120373737dc326"
 }

@@ -11,10 +11,15 @@ risk, scope, and an explicit High picker selection can only promote a turn.
 Bounded policy clamps may narrow an accidentally broad low-reasoning lane, but
 never a genuine full/high lane. All mutations are request local, so durable chat
 history and the installed Hermes source remain untouched.
+
+Action budgets only apply to bounded (System-1) tasks. When a bounded task outgrows
+its budget it escalates to the normal harness instead of being cut off; the no-tool
+``finalize`` lane is a late safety net, not the normal end of a long task.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import json
 import re
@@ -146,6 +151,12 @@ then return a concise result. If the evidence is genuinely insufficient, state t
 instead of exploring further.
 """
 
+_FINALIZE_PROMPT = """\
+Tools are no longer available for this turn. Do not call or describe tool calls.
+Write the final answer now from the evidence above: what was done, what was verified,
+and anything still incomplete with the specific next step.
+"""
+
 _FULL_STEERING = """\
 GLM adaptive execution:
 - Routine work: act with tools promptly and keep visible narration short.
@@ -165,18 +176,44 @@ def _setting(key: str, default: Any) -> Any:
         return default
 
 
+def _gliner_module() -> Any:
+    module = sys.modules.get("hermes_gliner_extract")
+    if module is not None:
+        return module
+    for module in tuple(sys.modules.values()):
+        if module is not None and str(getattr(module, "__name__", "")).endswith(".gliner_extract"):
+            return module
+    return None
+
+
 def _consume_gliner_evidence() -> dict[str, Any] | None:
     """Read the sibling plugin's request-local signal without a hard dependency."""
-    for module in tuple(sys.modules.values()):
-        if module is None or not str(getattr(module, "__name__", "")).endswith(".gliner_extract"):
-            continue
-        consume = getattr(module, "consume_evidence", None)
-        if callable(consume):
-            try:
-                return consume()
-            except Exception:
-                logger.debug("GLiNER evidence consume failed", exc_info=True)
+    consume = getattr(_gliner_module(), "consume_evidence", None)
+    if callable(consume):
+        try:
+            return consume()
+        except Exception:
+            logger.debug("GLiNER evidence consume failed", exc_info=True)
     return None
+
+
+def _gliner_evidence(text: str) -> dict[str, Any] | None:
+    """Evidence from middleware state, else a direct (cached, time-boxed) classify.
+
+    Hermes runs middleware in plugin load order, so the GLiNER middleware may run
+    after this router. Pulling directly keeps GLiNER effective in either order.
+    """
+    evidence = _consume_gliner_evidence()
+    if evidence is not None or not text:
+        return evidence
+    classify = getattr(_gliner_module(), "classify", None)
+    if not callable(classify):
+        return None
+    try:
+        return classify(text)
+    except Exception:
+        logger.debug("GLiNER direct classify failed", exc_info=True)
+        return None
 
 
 def _is_glm(model: str) -> bool:
@@ -341,9 +378,73 @@ def _frontier_state(messages: list[Any]) -> dict[str, Any]:
     try:
         from agent.frontier_harness import _analyze, _load_policy
 
-        return _analyze(_current_turn_messages(messages), _load_policy())
+        state = _analyze(_current_turn_messages(messages), _load_policy())
+        if isinstance(state, dict) and "failure_count" in state:
+            return state
     except Exception:
-        return {}
+        pass
+    # The overlay is missing or its internals changed after an upstream update.
+    # Escalation on repeated failure must not silently disappear with it.
+    return _local_failure_state(messages)
+
+
+def _local_failure_state(messages: list[Any]) -> dict[str, Any]:
+    """Current-turn failure and repeated-call counts from the transcript alone."""
+    signatures: dict[str, int] = {}
+    failures = 0
+    for message in _current_turn_messages(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
+            for call in message["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = str(function.get("name") or call.get("name") or "")
+                signature = name + "|" + str(function.get("arguments") or "")
+                signatures[signature] = signatures.get(signature, 0) + 1
+        elif message.get("role") == "tool" and _single_result_failed(message.get("content")):
+            failures += 1
+    return {
+        "failure_count": failures,
+        "max_repeated_signature": max(signatures.values(), default=0),
+    }
+
+
+def _single_result_failed(content: Any) -> bool:
+    try:
+        from agent.frontier_harness import _failed_result
+
+        return bool(_failed_result(content))
+    except Exception:
+        pass
+    parsed = content
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+        except (TypeError, ValueError):
+            parsed = None
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status") or "").lower()
+        success = (
+            parsed.get("ok") is True
+            or parsed.get("success") is True
+            or parsed.get("isError") is False
+            or status in {"ok", "success", "completed", "complete"}
+        )
+        exit_code = parsed.get("exit_code", parsed.get("returncode"))
+        if (
+            parsed.get("ok") is False
+            or parsed.get("success") is False
+            or parsed.get("isError") is True
+            or status in {"error", "failed", "failure"}
+        ):
+            return True
+        if isinstance(exit_code, int):
+            return exit_code != 0
+        return bool(parsed.get("error")) and not success
+    text = content if isinstance(content, str) else str(content or "")
+    return bool(_EXPLICIT_FAILURE_TEXT.match(text))
 
 
 def _tool_result_failed(messages: list[Any]) -> bool:
@@ -354,46 +455,7 @@ def _tool_result_failed(messages: list[Any]) -> bool:
         role = message.get("role")
         if role == "user":
             break
-        if role != "tool":
-            continue
-        content = message.get("content")
-        try:
-            from agent.frontier_harness import _failed_result
-
-            failed = _failed_result(content)
-        except Exception:
-            parsed = content
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                except (TypeError, ValueError):
-                    parsed = None
-            if isinstance(parsed, dict):
-                status = str(parsed.get("status") or "").lower()
-                success = (
-                    parsed.get("ok") is True
-                    or parsed.get("success") is True
-                    or parsed.get("isError") is False
-                    or status in {"ok", "success", "completed", "complete"}
-                )
-                exit_code = parsed.get("exit_code", parsed.get("returncode"))
-                if (
-                    parsed.get("ok") is False
-                    or parsed.get("success") is False
-                    or parsed.get("isError") is True
-                    or status in {"error", "failed", "failure"}
-                ):
-                    return True
-                if isinstance(exit_code, int) and exit_code != 0:
-                    return True
-                if isinstance(exit_code, int) and exit_code == 0:
-                    continue
-                if parsed.get("error") and not success:
-                    return True
-                continue
-            text = content if isinstance(content, str) else str(content or "")
-            failed = bool(_EXPLICIT_FAILURE_TEXT.match(text))
-        if failed:
+        if role == "tool" and _single_result_failed(message.get("content")):
             return True
     return False
 
@@ -451,17 +513,40 @@ def _forced_tool_name(request: dict[str, Any]) -> str:
     return str(function.get("name") or "") if isinstance(function, dict) else ""
 
 
-def _bounded_tools(tools: Any, *, forced_tool: str = "", required: bool = False) -> list[Any]:
+def _bounded_tools(
+    tools: Any, *, forced_tool: str = "", required: bool = False,
+    used: set[str] | frozenset[str] = frozenset(),
+) -> list[Any]:
     if not isinstance(tools, list):
         return []
     configured = _setting("fast_tools", None)
-    allowed = set(configured) if isinstance(configured, list) and configured else _FAST_TOOLS
+    # Always a fresh set: adding to the module default would leak a forced tool
+    # into every later fast request.
+    allowed = set(configured) if isinstance(configured, list) and configured else set(_FAST_TOOLS)
     if forced_tool:
         allowed.add(forced_tool)
+    # Tools already called this turn stay declared, so the replayed calls and
+    # results still match a schema the model can see.
+    allowed |= set(used)
     selected = [tool for tool in tools if _tool_name(tool) in allowed]
     # An explicit required-tools request with no matching fast tool must retain
     # its original surface instead of becoming an invalid provider request.
     return tools if required and not selected else selected
+
+
+def _used_tool_names(messages: list[Any]) -> set[str]:
+    names: set[str] = set()
+    for message in _current_turn_messages(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            name = (function.get("name") if isinstance(function, dict) else None) or call.get("name")
+            if name:
+                names.add(str(name))
+    return names
 
 
 def _compact_message(message: Any) -> Any:
@@ -480,6 +565,41 @@ def _compact_message(message: Any) -> Any:
     return keep
 
 
+def _exchange_indices(messages: list[Any], user_idx: int) -> tuple[int, int]:
+    """Return (previous real user index, its final text response index) before ``user_idx``."""
+    assistant_idx = -1
+    for idx in range(user_idx - 1, -1, -1):
+        message = messages[idx]
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls"):
+            assistant_idx = idx
+            break
+    if assistant_idx < 0:
+        return -1, -1
+    for idx in range(assistant_idx - 1, -1, -1):
+        message = messages[idx]
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and not _is_synthetic_user(message)
+        ):
+            return idx, assistant_idx
+    return -1, assistant_idx
+
+
+def _truncate_exchange(selected: list[Any]) -> list[Any]:
+    limit = max(160, int(_setting("fast_recent_context_chars", 1200)))
+    compacted: list[Any] = []
+    for message in selected:
+        item = _compact_message(message)
+        if isinstance(item, dict) and isinstance(item.get("content"), str) and len(item["content"]) > limit:
+            item = dict(item)
+            item["content"] = item["content"][:limit] + "\n[recent context truncated]"
+        compacted.append(item)
+    return compacted
+
+
 def _recent_exchange(messages: list[Any], user_idx: int) -> list[Any]:
     """Keep only the endpoints of one completed exchange.
 
@@ -490,42 +610,27 @@ def _recent_exchange(messages: list[Any], user_idx: int) -> list[Any]:
     prefill dominate latency, so retain only the prior real user message and
     the final text response.
     """
+    return _recent_exchanges(messages, user_idx, 1)
+
+
+def _recent_exchanges(messages: list[Any], user_idx: int, count: int) -> list[Any]:
+    """Endpoints of up to ``count`` completed exchanges before ``user_idx``, oldest first."""
     if user_idx <= 0:
         return []
-    assistant_idx = -1
-    for idx in range(user_idx - 1, -1, -1):
-        message = messages[idx]
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") == "assistant" and message.get("content") and not message.get("tool_calls"):
-            assistant_idx = idx
+    selected: list[Any] = []
+    end = user_idx
+    for _ in range(max(1, count)):
+        previous_user_idx, assistant_idx = _exchange_indices(messages, end)
+        if assistant_idx < 0:
             break
-    if assistant_idx < 0:
-        return []
-    previous_user_idx = -1
-    for idx in range(assistant_idx - 1, -1, -1):
-        message = messages[idx]
-        if (
-            isinstance(message, dict)
-            and message.get("role") == "user"
-            and not _is_synthetic_user(message)
-        ):
-            previous_user_idx = idx
+        pair = [messages[assistant_idx]]
+        if previous_user_idx >= 0:
+            pair.insert(0, messages[previous_user_idx])
+        selected[:0] = pair
+        if previous_user_idx <= 0:
             break
-    selected = (
-        [messages[previous_user_idx], messages[assistant_idx]]
-        if previous_user_idx >= 0
-        else [messages[assistant_idx]]
-    )
-    limit = max(160, int(_setting("fast_recent_context_chars", 1200)))
-    compacted: list[Any] = []
-    for message in selected:
-        item = _compact_message(message)
-        if isinstance(item, dict) and isinstance(item.get("content"), str) and len(item["content"]) > limit:
-            item = dict(item)
-            item["content"] = item["content"][:limit] + "\n[recent context truncated]"
-        compacted.append(item)
-    return compacted
+        end = previous_user_idx
+    return _truncate_exchange(selected)
 
 
 def _needs_recent_exchange(messages: list[Any], user_idx: int) -> bool:
@@ -605,7 +710,13 @@ def _compact_harness_context(messages: list[Any]) -> list[Any]:
         for message in messages[:user_idx]
         if isinstance(message, dict) and message.get("role") in {"system", "developer"}
     ]
-    recent = _recent_exchange(messages, user_idx)
+    # Normal/high work keeps a few prior exchanges so references to earlier
+    # decisions survive; System-1 keeps only one (see _compact_current_turn).
+    try:
+        exchanges = max(1, int(_setting("history_recent_exchanges", 3)))
+    except (TypeError, ValueError):
+        exchanges = 3
+    recent = _recent_exchanges(messages, user_idx, exchanges)
     tail = messages[user_idx:]
     try:
         keep_rounds = max(2, int(_setting("history_recent_tool_rounds", 6)))
@@ -650,19 +761,21 @@ def _apply_history_compaction(request: dict[str, Any]) -> tuple[dict[str, Any], 
 
 def _apply_fast_lane(
     request: dict[str, Any], *, no_tools: bool = False, full_tools: bool = False,
-    force_mutation: bool = False,
+    force_mutation: bool = False, finalize: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     updated = dict(request)
     message_key, messages = _request_messages(updated)
     before_messages = len(messages)
     before_tools = len(updated.get("tools") or []) if isinstance(updated.get("tools"), list) else 0
+    used = _used_tool_names(messages)
     if message_key:
         updated[message_key] = _compact_current_turn(messages)
-        if force_mutation and updated[message_key]:
+        addendum = _FINALIZE_PROMPT if finalize else _MUTATION_GATE_PROMPT if force_mutation else ""
+        if addendum and updated[message_key]:
             system = updated[message_key][0]
             if isinstance(system, dict) and system.get("role") == "system":
                 system = dict(system)
-                system["content"] = str(system.get("content") or "") + "\n" + _MUTATION_GATE_PROMPT
+                system["content"] = str(system.get("content") or "") + "\n" + addendum
                 updated[message_key][0] = system
     if no_tools:
         # OpenAI-compatible servers differ here: vLLM rejects an explicit
@@ -675,6 +788,7 @@ def _apply_fast_lane(
             updated["tools"],
             forced_tool=_forced_tool_name(updated),
             required=updated.get("tool_choice") == "required",
+            used=used,
         )
         if force_mutation:
             mutation_tools = [
@@ -682,10 +796,13 @@ def _apply_fast_lane(
             ]
             if mutation_tools:
                 updated["tools"] = mutation_tools
+    # The cap only bounds runaway output; it does not speed up generation. It must
+    # fit a whole write_file/patch payload, or the tool-call JSON is truncated and
+    # the turn fails with a malformed call.
     try:
-        fast_max = max(512, int(_setting("fast_max_tokens", 4096)))
+        fast_max = max(2048, int(_setting("fast_max_tokens", 16384)))
     except (TypeError, ValueError):
-        fast_max = 4096
+        fast_max = 16384
     if isinstance(updated.get("max_tokens"), int):
         updated["max_tokens"] = min(updated["max_tokens"], fast_max)
     elif "max_completion_tokens" in updated and isinstance(updated.get("max_completion_tokens"), int):
@@ -796,6 +913,13 @@ def _mutation_gate_needed(messages: list[Any], user: str) -> bool:
     return mutations == 0 and reads >= threshold
 
 
+def _int_setting(key: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(_setting(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _decide_lane(
     request: dict[str, Any], messages: list[Any], evidence: dict[str, Any] | None,
     *, api_call_count: int, turn_id: str,
@@ -821,28 +945,41 @@ def _decide_lane(
         full_confidence = float(_setting("full_confidence", 0.60))
         if confidence >= full_confidence:
             return _remember_lane(turn_id, "full"), f"GLiNER {category} ({confidence:.2f})"
-    try:
-        bounded_chars = max(80, int(_setting("bounded_action_max_chars", 500)))
-    except (TypeError, ValueError):
-        bounded_chars = 500
-    try:
-        max_calls = max(1, int(_setting("fast_max_calls", 6)))
-    except (TypeError, ValueError):
-        max_calls = 6
-    effective_calls = _effective_fast_calls(messages, api_call_count)
-    try:
-        hard_max_calls = max(max_calls + 1, int(_setting("fast_hard_max_calls", 10)))
-    except (TypeError, ValueError):
-        hard_max_calls = 10
-    if effective_calls > hard_max_calls:
-        return _remember_lane(turn_id, "finalize"), (
-            f"bounded action exhausted ({effective_calls}>{hard_max_calls}); force final"
-        )
-    if effective_calls > max_calls:
-        return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
-            f"fast action budget exceeded ({effective_calls}>{max_calls}); compact low"
-        )
+    bounded_chars = _int_setting("bounded_action_max_chars", 500, 80)
+    fast_evidence = (
+        isinstance(evidence, dict)
+        and evidence.get("decision") == "fast"
+        and float(evidence.get("confidence") or 0.0) >= float(_setting("fast_confidence", 0.30))
+    )
+    bounded_task = bool(
+        user and len(user) <= bounded_chars and _BOUNDED_ACTION.search(user)
+    ) or fast_evidence
+
+    # Action budgets exist to keep System-1 work short. They never apply to normal
+    # harness work, which Hermes' own max_turns and loop guardrails already bound.
+    if bounded_task:
+        max_calls = _int_setting("fast_max_calls", 6, 1)
+        hard_max_calls = max(max_calls + 1, _int_setting("fast_hard_max_calls", 10, 2))
+        finalize_after = max(hard_max_calls + 1, _int_setting("fast_finalize_after_calls", 24, 3))
+        effective_calls = _effective_fast_calls(messages, api_call_count)
+        if effective_calls > finalize_after:
+            return _remember_lane(turn_id, "finalize"), (
+                f"bounded task exhausted ({effective_calls}>{finalize_after}); force final"
+            )
+        if effective_calls > hard_max_calls:
+            # The task is bigger than it looked. Give it the full harness rather
+            # than cutting it off mid-change.
+            return _remember_lane(turn_id, "standard"), (
+                f"bounded budget exceeded ({effective_calls}>{hard_max_calls}); escalate to harness"
+            )
+        if effective_calls > max_calls:
+            return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
+                f"fast action budget exceeded ({effective_calls}>{max_calls}); compact low"
+            )
     if failures == 1 or _tool_result_failed(messages):
+        if not bounded_task:
+            # Normal work that hits a tool error needs the full harness, not less.
+            return _remember_lane(turn_id, "standard"), "first tool failure; normal harness"
         # A single schema/argument miss on a bounded action is routine correction,
         # not permission to expand back to the entire 39-tool harness. The clamp
         # can narrow standard/low, but cannot demote full/high.
@@ -868,16 +1005,43 @@ def _decide_lane(
         return _remember_lane(turn_id, "fast", bounded_clamp=True), (
             f"short bounded action{inherited_note}{weak}"
         )
-    if isinstance(evidence, dict):
-        decision = str(evidence.get("decision") or "")
+    if fast_evidence:
         category = str(evidence.get("category") or "unknown")
         confidence = float(evidence.get("confidence") or 0.0)
-        if decision == "fast" and confidence >= float(_setting("fast_confidence", 0.30)):
-            inherited_note = "; inherited prior task" if inherited else ""
-            return _remember_lane(turn_id, "fast", bounded_clamp=True), (
-                f"GLiNER {category} ({confidence:.2f}){inherited_note}"
-            )
+        inherited_note = "; inherited prior task" if inherited else ""
+        return _remember_lane(turn_id, "fast", bounded_clamp=True), (
+            f"GLiNER {category} ({confidence:.2f}){inherited_note}"
+        )
     return _remember_lane(turn_id, "standard"), "uncertain; normal harness"
+
+
+def _turn_key(kwargs: dict[str, Any], messages: list[Any]) -> str:
+    """Hermes' turn id, else a stable id for the active real user message.
+
+    Without a key, sticky high reasoning and continuation lane preservation
+    silently stop working, so derive one from the session and user row.
+    """
+    turn_id = str(kwargs.get("turn_id") or "")
+    if turn_id:
+        return turn_id
+    for idx in range(len(messages or []) - 1, -1, -1):
+        message = messages[idx]
+        if isinstance(message, dict) and message.get("role") == "user" and not _is_synthetic_user(message):
+            digest = hashlib.sha1(
+                json.dumps(message.get("content"), ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+            return f"derived:{kwargs.get('session_id') or kwargs.get('task_id') or ''}:{idx}:{digest}"
+    return ""
+
+
+def _finalize_retry(messages: list[Any]) -> bool:
+    """True when finalize already produced an empty/interrupted answer this turn."""
+    for message in reversed(_current_turn_messages(messages)[1:]):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _is_synthetic_user(message)
+        if isinstance(message, dict) and message.get("role") in {"assistant", "tool"}:
+            return False
+    return False
 
 
 def on_llm_request(**kwargs: Any):
@@ -892,8 +1056,8 @@ def on_llm_request(**kwargs: Any):
         api_call_count = int(kwargs.get("api_call_count") or 1)
     except (TypeError, ValueError):
         api_call_count = 1
-    turn_id = str(kwargs.get("turn_id") or "")
-    evidence = _consume_gliner_evidence()
+    turn_id = _turn_key(kwargs, messages)
+    evidence = _gliner_evidence(_routing_user_text(messages))
     lane, reason = _decide_lane(
         request, messages, evidence, api_call_count=api_call_count, turn_id=turn_id
     )
@@ -903,9 +1067,16 @@ def on_llm_request(**kwargs: Any):
     force_mutation = _mutation_gate_needed(messages, user)
     if lane == "fast":
         updated = _apply_effort(request, "low", thinking=False)
+        # A prose answer drops tools, but only before the turn has used any:
+        # replaying tool calls against a request with no tools makes GLM emit
+        # tool markup as text or an empty reply.
         updated, stats = _apply_fast_lane(
             updated,
-            no_tools=isinstance(evidence, dict) and evidence.get("category") == "quick_response",
+            no_tools=(
+                isinstance(evidence, dict)
+                and evidence.get("category") == "quick_response"
+                and not _used_tool_names(messages)
+            ),
             force_mutation=force_mutation,
         )
         effort = "off"
@@ -915,9 +1086,12 @@ def on_llm_request(**kwargs: Any):
         updated, stats = _apply_fast_lane(updated, force_mutation=force_mutation)
         effort = "low"
     elif lane == "finalize":
-        updated = _apply_effort(request, "low", thinking=False)
-        updated, stats = _apply_fast_lane(updated, no_tools=True)
-        effort = "off"
+        # If a thinking-off final already came back empty, give it low reasoning
+        # instead of repeating the same empty request.
+        retry = _finalize_retry(messages)
+        updated = _apply_effort(request, "low", thinking=retry)
+        updated, stats = _apply_fast_lane(updated, no_tools=True, finalize=True)
+        effort = "low" if retry else "off"
     elif lane == "full":
         updated = _apply_effort(request, "high", thinking=True)
         updated, stats = _apply_history_compaction(updated)
@@ -927,6 +1101,10 @@ def on_llm_request(**kwargs: Any):
         updated, stats = _apply_history_compaction(updated)
         effort = "low"
 
+    if not logger.isEnabledFor(logging.INFO):
+        # Serializing a long transcript just to measure it costs real time on
+        # every tool hop; skip it when nobody will read the log line.
+        return {"request": updated, "source": "glm-codex-effort", "reason": f"{lane}:{reason}"}
     logger.info(
         "glm-system1-router: lane=%s effort=%s reason=%s model=%s call=%s "
         "messages=%s/%s tools=%s/%s payload_chars=%s+%s",

@@ -19,8 +19,14 @@ providers:
     models:
       glm-5.3-flash-exl3-dspark:
         context_length: 1048576
-        stale_timeout_seconds: 21600
-        timeout_seconds: 21600
+        # Quiet-stream gap before Hermes reconnects. An explicit value overrides
+        # every built-in floor, so 21600 left a dead stream hanging for 6 hours.
+        # 900s matches Hermes' local-endpoint default and covers long prefill;
+        # raise it only if your server logs show longer time-to-first-token.
+        stale_timeout_seconds: 900
+        timeout_seconds: 1800
+        # Wall-clock cap for one request that keeps streaming but never finishes.
+        hard_timeout_seconds: 3600
     key_env: GLM_FLASH_API_KEY
   deepseek-v4-flash:
     name: DeepSeek V4 Flash 0731
@@ -304,11 +310,27 @@ command_allowlist:
   - script execution via -e/-c flag
 plugins:
   enabled:
+    # GLiNER must be enabled for semantic routing. The router pulls its evidence
+    # directly, so load order no longer matters.
+    - gliner-extract
     - glm-codex-effort
   disabled: []
   entries:
+    gliner-extract:
+      enabled: true
+      settings:
+        prewarm: true
+        timeout_ms: 250
     glm-codex-effort:
       enabled: true
+      settings:
+        # System-1 budgets apply only to bounded tasks. Past fast_hard_max_calls the
+        # task escalates to the full harness; finalize is a late safety net.
+        fast_max_calls: 6
+        fast_hard_max_calls: 10
+        fast_finalize_after_calls: 24
+        fast_max_tokens: 16384
+        history_recent_exchanges: 3
 code_execution:
   timeout: 300
   max_tool_calls: 8

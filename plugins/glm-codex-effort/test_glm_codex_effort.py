@@ -68,7 +68,8 @@ def test_fast_lane_compacts_context_tools_and_disables_thinking(monkeypatch):
     assert {_tool["function"]["name"] for _tool in routed["tools"]} == {
         "terminal", "process", "read_file", "web_search", "patch", "write_file"
     }
-    assert routed["max_tokens"] == 4096
+    # Capped to fit a full write_file/patch payload, never truncated to 4096.
+    assert routed["max_tokens"] == 16384
 
 
 def test_fast_tool_hop_keeps_tool_protocol(monkeypatch):
@@ -229,14 +230,166 @@ def test_fast_lane_call_budget_promotes_to_compact_low(monkeypatch):
     assert len(out["request"]["tools"]) < len(req["tools"])
 
 
-def test_fast_lane_hard_budget_forces_text_completion(monkeypatch):
+def test_fast_lane_hard_budget_escalates_instead_of_cutting_off(monkeypatch):
     monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
     req = request("Perform the bounded operation")
     out = router.on_llm_request(
         request=req, model=req["model"], api_call_count=11, turn_id="t-hard-budget"
     )
+    ctk = out["request"]["extra_body"]["chat_template_kwargs"]
+    assert ctk["enable_thinking"] is True and ctk["reasoning_effort"] == "low"
+    assert len(out["request"]["tools"]) == len(req["tools"])
+    assert out["request"]["messages"][0]["content"] == "very large system prompt"
+    assert "escalate to harness" in out["reason"]
+
+
+def test_bounded_task_finalizes_only_as_late_safety_net(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Perform the bounded operation")
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=25, turn_id="t-finalize-net"
+    )
     assert "tools" not in out["request"]
     assert out["request"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "Tools are no longer available" in out["request"]["messages"][0]["content"]
+
+
+def test_finalize_retry_after_empty_reply_turns_low_reasoning_on(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Perform the bounded operation")
+    req["messages"].append({"role": "user", "content": router._EMPTY_RECOVERY_TEXT})
+    router._TURN_LANES["t-finalize-retry"] = ("finalize", router.time.monotonic())
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=26, turn_id="t-finalize-retry"
+    )
+    ctk = out["request"]["extra_body"]["chat_template_kwargs"]
+    assert "tools" not in out["request"]
+    assert ctk["enable_thinking"] is True and ctk["reasoning_effort"] == "low"
+
+
+def test_normal_harness_work_is_never_budget_clamped(monkeypatch):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence", lambda: evidence("unknown", "ambiguous", .2)
+    )
+    req = request("The dashboard and the export flow disagree about totals for some accounts")
+    for count in (7, 11, 40):
+        out = router.on_llm_request(
+            request=req, model=req["model"], api_call_count=count, turn_id="t-long-standard"
+        )
+        ctk = out["request"]["extra_body"]["chat_template_kwargs"]
+        assert ctk["enable_thinking"] is True and ctk["reasoning_effort"] == "low"
+        assert len(out["request"]["tools"]) == len(req["tools"])
+        assert out["request"]["messages"][0]["content"] == "very large system prompt"
+
+
+def test_first_failure_in_normal_work_keeps_full_harness(monkeypatch):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence", lambda: evidence("unknown", "ambiguous", .2)
+    )
+    req = request("The dashboard and the export flow disagree about totals", tools=True, failed=True)
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=2, turn_id="t-standard-failure"
+    )
+    assert len(out["request"]["tools"]) == len(req["tools"])
+    assert out["request"]["messages"][0]["content"] == "very large system prompt"
+    assert "normal harness" in out["reason"]
+
+
+def test_forced_tool_does_not_leak_into_later_fast_requests(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Perform the bounded operation")
+    req["tools"].append(tool("custom_bounded_tool"))
+    req["tool_choice"] = {"type": "function", "function": {"name": "custom_bounded_tool"}}
+    router.on_llm_request(request=req, model=req["model"], api_call_count=1, turn_id="t-leak-1")
+    assert "custom_bounded_tool" not in router._FAST_TOOLS
+    later = request("Perform another bounded operation")
+    later["tools"].append(tool("custom_bounded_tool"))
+    out = router.on_llm_request(request=later, model=later["model"], api_call_count=1, turn_id="t-leak-2")
+    assert "custom_bounded_tool" not in {_tool["function"]["name"] for _tool in out["request"]["tools"]}
+
+
+def test_tool_already_used_this_turn_stays_declared(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Initiate the environment")
+    req["messages"].extend([
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "s1", "type": "function", "function": {"name": "skill_view", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "s1", "content": '{"ok":true}'},
+    ])
+    out = router.on_llm_request(request=req, model=req["model"], api_call_count=2, turn_id="t-used")
+    assert "skill_view" in {_tool["function"]["name"] for _tool in out["request"]["tools"]}
+
+
+def test_quick_response_keeps_tools_once_turn_has_tool_history(monkeypatch):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence", lambda: evidence("fast", "quick_response", .9)
+    )
+    req = request("What does Vite host binding mean?", tools=True)
+    out = router.on_llm_request(request=req, model=req["model"], api_call_count=2, turn_id="t-prose-hop")
+    assert "terminal" in {_tool["function"]["name"] for _tool in out["request"]["tools"]}
+
+
+def test_sticky_high_survives_missing_turn_id(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    first = request("Initiate the environment", high=True)
+    router.on_llm_request(request=first, model=first["model"], api_call_count=1, session_id="s-no-turn")
+    later = request("[System: Continue now. Execute the required tool calls.]")
+    later["messages"] = [
+        *first["messages"],
+        {"role": "assistant", "content": "Paused."},
+        {"role": "user", "content": later["messages"][-1]["content"]},
+    ]
+    out = router.on_llm_request(request=later, model=later["model"], api_call_count=2, session_id="s-no-turn")
+    assert out["request"]["extra_body"]["chat_template_kwargs"]["reasoning_effort"] == "high"
+
+
+def test_router_pulls_gliner_evidence_when_middleware_ran_after_it(monkeypatch):
+    import types
+
+    fake = types.ModuleType("hermes_gliner_extract")
+    fake.consume_evidence = lambda: None
+    seen = []
+    fake.classify = lambda text: seen.append(text) or evidence("fast", "quick_response", .9)
+    monkeypatch.setitem(router.sys.modules, "hermes_gliner_extract", fake)
+    req = request("What does Vite host binding mean?")
+    out = router.on_llm_request(request=req, model=req["model"], api_call_count=1, turn_id="t-pull")
+    assert seen == ["What does Vite host binding mean?"]
+    assert "tools" not in out["request"]
+
+
+def test_repeated_failures_escalate_without_frontier_overlay(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Initiate the environment", tools=True, failed=True)
+    req["messages"].extend([
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "2", "type": "function", "function": {"name": "terminal", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "2", "content": "ERROR: permission denied"},
+    ])
+    assert router._local_failure_state(req["messages"]) == {
+        "failure_count": 2, "max_repeated_signature": 2,
+    }
+
+
+def test_harness_compaction_keeps_recent_exchanges(monkeypatch):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence", lambda: evidence("unknown", "ambiguous", .2)
+    )
+    req = request("Handle the earlier thing")
+    history = [{"role": "system", "content": "sys"}]
+    for index in range(12):
+        history.extend([
+            {"role": "user", "content": f"question {index}"},
+            {"role": "assistant", "content": f"answer {index}"},
+        ])
+    req["messages"] = [*history, {"role": "user", "content": "Handle the earlier thing"}]
+    out = router.on_llm_request(request=req, model=req["model"], api_call_count=1, turn_id="t-exchanges")
+    contents = [message["content"] for message in out["request"]["messages"]]
+    assert contents == [
+        "sys", "question 9", "answer 9", "question 10", "answer 10",
+        "question 11", "answer 11", "Handle the earlier thing",
+    ]
 
 
 def test_retry_followup_inherits_prior_bounded_intent_and_clamps_broad_lane(monkeypatch):
@@ -304,8 +457,12 @@ def test_retry_followup_reaches_compact_and_finalize_budgets(monkeypatch):
     )
     assert compact["request"]["extra_body"]["chat_template_kwargs"]["reasoning_effort"] == "low"
     assert len(compact["request"]["tools"]) < len(req["tools"])
-    final = router.on_llm_request(
+    escalated = router.on_llm_request(
         request=req, model=req["model"], api_call_count=11, turn_id="t-inherit-budget"
+    )
+    assert len(escalated["request"]["tools"]) == len(req["tools"])
+    final = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=25, turn_id="t-inherit-budget"
     )
     assert "tools" not in final["request"]
 
@@ -525,3 +682,14 @@ def test_chat_template_off_is_really_off():
         "enable_thinking": False,
         "clear_thinking": True,
     }
+
+
+def test_info_logging_path_returns_same_routing(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Initiate the environment")
+    caplog.set_level(logging.INFO, logger=router.logger.name)
+    out = router.on_llm_request(request=req, model=req["model"], api_call_count=1, turn_id="t-log")
+    assert out["request"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "glm-system1-router: lane=fast" in caplog.text

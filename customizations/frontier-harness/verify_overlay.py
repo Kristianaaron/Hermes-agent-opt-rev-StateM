@@ -37,6 +37,7 @@ SOURCE_MARKERS = {
         "_provider_wait_notice",
         "_surface_countdown_wait",
         "_kill_hard_timeout",
+        "_stream_hard_timeout = get_provider_hard_timeout",
         "_apply_commentary_gate_to_tools",
         "_strip_tools_from_kwargs_for_commentary_gate",
         "_omit_empty_tools_at_wire_boundary",

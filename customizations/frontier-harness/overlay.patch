@@ -1,7 +1,16 @@
 diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
-index 315641d14c..056fa2aea7 100644
+index 315641d1..f7f7e793 100644
 --- a/agent/chat_completion_helpers.py
 +++ b/agent/chat_completion_helpers.py
+@@ -23,7 +23,7 @@ from dataclasses import dataclass
+ from types import SimpleNamespace
+ from typing import Any, Dict, Optional
+
+-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
++from hermes_cli.timeouts import get_provider_hard_timeout, get_provider_request_timeout, get_provider_stale_timeout
+ from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+ from agent.error_classifier import (
+     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 @@ -52,6 +52,15 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
  logger = logging.getLogger(__name__)
  _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
@@ -177,7 +186,18 @@ index 315641d14c..056fa2aea7 100644
 
 
  def _model_dump_safe(obj):
-@@ -2895,6 +3011,7 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -2704,6 +2820,10 @@ class _StreamingCall(StreamingWaitMonitor):
+         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
+         # detector (``_resolve_stale_timeout``); None until resolved.
+         self._stream_stale_timeout = None
++        # Wall-clock cap from ``hard_timeout_seconds``; the monitor reads both. A
++        # stream that keeps emitting but never finishes is not caught as stale.
++        self.started_at = time.time()
++        self._stream_hard_timeout = get_provider_hard_timeout(agent.provider, agent.model)
+         self.stream_attempt_lock = threading.Lock()
+         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
+         self.managed_stream_holder = {"stream": None}
+@@ -2895,6 +3015,7 @@ class _StreamingCall(StreamingWaitMonitor):
          return usage, finish_reason
 
      def _open_chat_stream(self, stream_kwargs: dict[str, Any]):
@@ -185,7 +205,7 @@ index 315641d14c..056fa2aea7 100644
          # Native Gemini rejects OpenAI's usage-streaming extension; so do strict endpoints that
          # already 4xx'd on it this session (``_stream_options_unsupported``, see #9705).
          if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
-@@ -2906,6 +3023,9 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -2906,6 +3027,9 @@ class _StreamingCall(StreamingWaitMonitor):
          # #93650: as above — the streaming path carries the same bulk
          # messages/tools payload and pays the same client-side walk.
          stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
@@ -195,7 +215,7 @@ index 315641d14c..056fa2aea7 100644
          return request_client.chat.completions.create(**stream_kwargs)
 
      def _chat_stream_created(self, raw_stream: Any) -> None:
-@@ -3059,6 +3179,11 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -3059,6 +3183,11 @@ class _StreamingCall(StreamingWaitMonitor):
                      reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                  reasoning_parts.append(reasoning_text)
                  self._emit_reasoning(reasoning_text)
@@ -207,7 +227,7 @@ index 315641d14c..056fa2aea7 100644
              # Structured reasoning_details deltas carry the provider's replay data; the
              # non-streaming path already keeps them, so dropping them here lost
              # reasoning continuity on nearly every turn. Pydantic parks unknown fields
-@@ -3209,11 +3334,14 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -3209,11 +3338,14 @@ class _StreamingCall(StreamingWaitMonitor):
              # Only when present: _build_assistant_message's passthrough persists them
              # for replay, and non-reasoning providers keep the attribute absent.
              message.reasoning_details = reasoning_details
@@ -223,7 +243,7 @@ index 315641d14c..056fa2aea7 100644
          # A held router timeout shim (#68396) is rejected by validate_response and retried;
          # releasing its text here would show the provider failure as assistant output.
          if not is_router_timeout_shim(response):
-@@ -3565,6 +3693,19 @@ class _StreamingCall(StreamingWaitMonitor):
+@@ -3565,6 +3697,19 @@ class _StreamingCall(StreamingWaitMonitor):
          except Exception:
              logger.debug("Stale stream socket shutdown failed", exc_info=True)
 
@@ -3512,10 +3532,10 @@ index 369ab21365..6b8420034d 100644
 +    assert _abort_reason(agent, text, False) == _REPETITION_DOMINATED
 +    assert _abort_reason(agent, text, True) is None
 diff --git a/tests/agent/test_stream_wait_notice.py b/tests/agent/test_stream_wait_notice.py
-index 69a79bce4d..ab302b1982 100644
+index 69a79bce..5ed43578 100644
 --- a/tests/agent/test_stream_wait_notice.py
 +++ b/tests/agent/test_stream_wait_notice.py
-@@ -55,3 +55,38 @@ def test_resumed_chunks_clear_wait_without_erasing_local_load(monkeypatch, local
+@@ -55,3 +55,49 @@ def test_resumed_chunks_clear_wait_without_erasing_local_load(monkeypatch, local
          assert not any(text == "" for _, text in notices)
      else:
          assert notices[1:] == [(1060.4 if heartbeat_race else 1061.5, "")]
@@ -3554,6 +3574,17 @@ index 69a79bce4d..ab302b1982 100644
 +    call._call_done = Done()
 +    call._monitor_loop()
 +    assert killed and killed[0] >= 5.0
++
++
++def test_streaming_call_reads_configured_hard_timeout(monkeypatch):
++    """The monitor's wall-clock check needs both values set by the constructor."""
++    seen = []
++    monkeypatch.setattr(h, "get_provider_hard_timeout", lambda provider, model: seen.append((provider, model)) or 1800.0)
++    agent = SimpleNamespace(model="glm-5.3-flash", provider="custom", base_url="http://127.0.0.1:8000/v1", api_mode="chat_completions")
++    call = h._StreamingCall(agent, {"model": "glm-5.3-flash"}, None)
++    assert call._stream_hard_timeout == 1800.0
++    assert isinstance(call.started_at, float)
++    assert seen == [("custom", "glm-5.3-flash")]
 diff --git a/tests/agent/test_tool_argument_normalization.py b/tests/agent/test_tool_argument_normalization.py
 new file mode 100644
 index 0000000000..0c48cf0049

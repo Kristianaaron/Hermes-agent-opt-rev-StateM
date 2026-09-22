@@ -149,11 +149,13 @@ The router exposes these internal lanes:
 | `standard_compact` | Recovery, overflow, or a compact tool continuation | Compact context and bounded tools | Low |
 | `standard` | Normal agent work | Normal harness context and tools | Low |
 | `full` | Complex planning, architecture, risky work, repeated failure, or explicit high | Full context and tool set | High |
-| `finalize` | The bounded action budget is exhausted and only a result is needed | No tools | Thinking off |
+| `finalize` | Late safety net: a bounded task is still running long after it escalated | No tools, explicit final-answer instruction | Thinking off (low on retry after an empty reply) |
+
+Action budgets apply only to bounded (System-1) tasks. A bounded task that exceeds `fast_max_calls` gets compact low reasoning. One that exceeds `fast_hard_max_calls` escalates to the full harness instead of being cut off mid-change. `finalize` applies only after `fast_finalize_after_calls`. Normal harness work is never budget-clamped: Hermes' own `max_turns` and loop guardrails bound it.
 
 The router also provides:
 
-- A manual `high` override that remains sticky for the active task
+- A manual `high` override that remains sticky for the active task, including on entry points that do not supply a turn id
 - Correction away from unnecessary low-lane escalation without demoting active high reasoning
 - Natural-language continuation inheritance
 - Preservation of the active lane across Hermes-generated “continue now” system rows
@@ -161,6 +163,11 @@ The router also provides:
 - `clear_thinking: true` on GLM tool hops so prior reasoning is not needlessly re-deliberated
 - Invalid GLM effort values clamped to supported values rather than falling through to an unintended maximum
 - Provider capability gating so other models do not receive GLM-only fields
+- A first tool failure in normal work keeps the full harness; only bounded tasks recover in the compact lane
+- Repeated-failure escalation that still works if the overlay's harness internals are unavailable
+- Tools already called in the turn stay declared in the bounded tool set, and a prose-only request keeps tools once the turn has tool history
+- A fast-lane output cap (16384 by default) large enough for a whole `write_file`/`patch` payload
+- Normal and high lanes keep the last few completed exchanges (`history_recent_exchanges`, default 3) when compacting long sessions
 
 “Thinking off” here means the bounded fast/finalization request does not ask GLM for hidden reasoning. It does not disable the agent’s tool protocol, verification, or ordinary user-facing answer.
 
@@ -177,6 +184,8 @@ The router is semantic and state-aware; it is not a list of special-case keyword
 - `ambiguous`
 
 The result is evidence for the GLM router, not a replacement for the LLM. It runs locally, uses request-local inputs, and falls back to the normal harness path if the optional dependency or model is unavailable.
+
+Hermes passes the same original request to every `llm_request` middleware and keeps the last returned payload. The GLiNER middleware therefore never returns a request, and the router pulls evidence directly through `classify()`. Routing works whichever plugin loads first. Cached text returns without touching the worker. A request never queues behind a prediction that is still running. A failed model load backs off for five minutes instead of retrying on every request.
 
 Attached URL/file context is excluded from the routing text while remaining available to the model. This prevents a large pasted document, URL, or image description from being mistaken for a complex user intent merely because it increases input length.
 
@@ -262,10 +271,11 @@ When upstream changes overlap with a customization, the correct result is `NEEDS
    plugins/gliner-extract
    ```
 
-6. Install the optional GLiNER dependencies from `plugins/gliner-extract/requirements.txt` if semantic routing is desired.
+6. Install the optional GLiNER dependencies from `plugins/gliner-extract/requirements.txt` if semantic routing is desired, and list `gliner-extract` under `plugins.enabled` (see `config/config.example.yaml`). Without it the router still works, using harness evidence only.
 7. Install StateM and optional LFM vision dependencies separately when those capabilities are desired.
 8. Run the verifier before and after applying the overlay. Resolve `NEEDS_ATTENTION` rather than forcing the patch across an upstream conflict.
-9. Restart Hermes and verify the selected model, normal tools, provider path, checkpoints, and GLM routing behavior.
+9. Set finite stream timeouts for the GLM provider (`stale_timeout_seconds`, `timeout_seconds`, `hard_timeout_seconds`; see the example config). An explicit `stale_timeout_seconds` overrides Hermes' built-in floors, so a very large value makes a dead stream look like a hung agent. `reapply.py` requires `hard_timeout_seconds` in the live config.
+10. Restart Hermes and verify the selected model, normal tools, provider path, checkpoints, and GLM routing behavior.
 
 The bundle is update-safe, not update-automatic: after each Hermes update, run the verifier and review any changed source or configuration before reapplying.
 

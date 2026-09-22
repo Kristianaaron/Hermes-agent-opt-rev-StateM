@@ -77,8 +77,78 @@ def test_evidence_is_private_middleware_state(monkeypatch):
         "messages": [{"role": "user", "content": "initiate the development environment"}],
     }
     result = gliner_extract.on_llm_request(request=request, model=request["model"])
-    assert result["request"] == request
+    # Hermes keeps the last middleware payload; echoing the request would erase
+    # the router's lane decision when this plugin loads after it.
+    assert result is None
     assert gliner_extract.consume_evidence()["decision"] == "fast"
+
+
+def test_classify_is_order_independent_direct_entry(monkeypatch):
+    monkeypatch.setattr(gliner_extract, "_enabled", lambda: True)
+    seen = []
+    monkeypatch.setattr(
+        gliner_extract, "_signal",
+        lambda text: seen.append(text) or {"decision": "fast", "category": "quick_response",
+                                           "confidence": 0.9, "latency_ms": 1.0, "cached": False},
+    )
+    evidence = gliner_extract.classify("Fix the header\n\n--- Attached Context ---\n" + "x" * 5000)
+    assert evidence["decision"] == "fast"
+    assert seen == ["Fix the header"]
+
+
+def test_cached_text_skips_worker_and_busy_window(monkeypatch):
+    gliner_extract._CACHE.clear()
+    evidence = {"decision": "fast", "category": "bounded_operation", "confidence": 0.8,
+                "latency_ms": 3.0, "cached": False}
+    gliner_extract._cache_put("start the server", evidence)
+    monkeypatch.setattr(gliner_extract, "_BUSY_UNTIL", gliner_extract.time.monotonic() + 60)
+    hit = gliner_extract._signal("start the server")
+    assert hit["decision"] == "fast" and hit["cached"] is True
+
+
+def test_inflight_prediction_is_not_queued_behind(monkeypatch):
+    gliner_extract._CACHE.clear()
+
+    class Pending:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(gliner_extract, "_INFLIGHT", Pending())
+    monkeypatch.setattr(gliner_extract, "_BUSY_UNTIL", 0.0)
+    monkeypatch.setattr(gliner_extract, "_LOAD_FAILED_UNTIL", 0.0)
+    submitted = []
+    monkeypatch.setattr(gliner_extract._EXECUTOR, "submit", lambda *a: submitted.append(a))
+    assert gliner_extract._signal("a new uncached request") is None
+    assert submitted == []
+
+
+def test_load_failure_backs_off_instead_of_retrying_every_request(monkeypatch):
+    gliner_extract._CACHE.clear()
+    monkeypatch.setattr(gliner_extract, "_MODEL", None)
+    monkeypatch.setattr(gliner_extract, "_LOAD_FAILED_UNTIL", 0.0)
+    monkeypatch.setitem(gliner_extract.sys.modules, "gliner", None)  # ImportError
+    try:
+        gliner_extract._load_model()
+    except ImportError:
+        pass
+    assert gliner_extract._LOAD_FAILED_UNTIL > gliner_extract.time.monotonic()
+    monkeypatch.setattr(gliner_extract, "_INFLIGHT", None)
+    monkeypatch.setattr(gliner_extract, "_BUSY_UNTIL", 0.0)
+    submitted = []
+    monkeypatch.setattr(gliner_extract._EXECUTOR, "submit", lambda *a: submitted.append(a))
+    assert gliner_extract._signal("another uncached request") is None
+    assert submitted == []
+
+
+def test_middleware_accepts_glm53_model_alias(monkeypatch):
+    monkeypatch.setattr(gliner_extract, "_enabled", lambda: True)
+    monkeypatch.setattr(gliner_extract, "_signal", lambda text: {
+        "decision": "fast", "category": "quick_response", "confidence": 0.9,
+        "latency_ms": 1.0, "cached": True,
+    })
+    request = {"model": "glm53-flash", "messages": [{"role": "user", "content": "hello"}]}
+    assert gliner_extract.on_llm_request(request=request, model="glm53-flash") is None
+    assert gliner_extract.consume_evidence()["category"] == "quick_response"
 
 
 def test_irreversible_language_never_routes_fast():

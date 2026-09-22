@@ -1,5 +1,5 @@
 name: glm-codex-effort
-version: "2.1.0"
+version: "2.2.0"
 description: "Semantic GLM System-1 routing with bounded recovery, inspect-to-act gating, and compact context."
 author: "Kristian Aaron"
 kind: standalone
