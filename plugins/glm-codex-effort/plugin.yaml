@@ -1,6 +1,6 @@
 name: glm-codex-effort
-version: "1.1.0"
-description: "Codex-style adaptive GLM 5.3 thinking: high for plan/repair, low for simple tool hops. Never disables thinking."
+version: "2.1.0"
+description: "Semantic GLM System-1 routing with bounded recovery, inspect-to-act gating, and compact context."
 author: "Kristian Aaron"
 kind: standalone
 manifest_version: 1

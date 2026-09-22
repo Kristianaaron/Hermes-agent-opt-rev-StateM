@@ -309,20 +309,6 @@ plugins:
   entries:
     glm-codex-effort:
       enabled: true
-    omp-coding:
-      allow_tool_override: false
-      enabled: false
-      routing_mode: manual
-      command: ${OMP_BIN}
-      timeout_seconds: 1800
-      detached_hard_timeout_seconds: 21600
-      repair_budget: 2
-      worktree_root: ${HERMES_HOME}/omp-worktrees
-      retain_worktrees: true
-      detached_host: ${OMP_DETACHED_HOST}
-      detached_command: ${OMP_DETACHED_COMMAND}
-      detached_worker_root: ${OMP_DETACHED_WORKER_ROOT}
-      detached_start_timeout_seconds: 90
 code_execution:
   timeout: 300
   max_tool_calls: 8

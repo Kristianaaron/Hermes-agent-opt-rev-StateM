@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+HERMES_HOME = Path(
+    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+).expanduser()
 REPO = HERMES_HOME / "hermes-agent"
 BUNDLE = HERMES_HOME / "customizations" / "frontier-harness"
 PATCH = BUNDLE / "overlay.patch"
@@ -30,15 +32,9 @@ LOG = HERMES_HOME / "customizations" / "logs" / "frontier-harness.log"
 UPDATE_MARKER = HERMES_HOME / ".hermes-update-in-progress"
 CONFIG = HERMES_HOME / "config.yaml"
 PYTHON = REPO / "venv" / "bin" / "python"
-OMP = Path(os.environ.get("OMP_BIN", "/opt/homebrew/bin/omp"))
-OMP_PLUGIN = HERMES_HOME / "plugins" / "omp-coding"
-OMP_AGENT = Path.home() / ".omp" / "agent"
-OMP_MODELS = OMP_AGENT / "models.yml"
-OMP_CONFIG = OMP_AGENT / "config.yml"
-OMP_KEY_READER = OMP_AGENT / "read_hermes_key.py"
-OMP_PLUGIN_BUNDLE = HERMES_HOME / "customizations" / "backups" / "omp-coding-desktop.bundle"
-OMP_CONFIG_BUNDLE = HERMES_HOME / "customizations" / "backups" / "omp-agent-config.bundle"
-CUSTOMIZATION_PLIST = Path.home() / "Library/LaunchAgents/ai.hermes.customizations.plist"
+GLINER_PLUGIN = HERMES_HOME / "plugins" / "gliner-extract" / "__init__.py"
+SYSTEM1_PLUGIN = HERMES_HOME / "plugins" / "glm-codex-effort" / "__init__.py"
+CUSTOMIZATION_PLIST = Path.home() / "Library" / "LaunchAgents" / "ai.hermes.customizations.plist"
 MAX_UPDATE_MARKER_AGE = 20 * 60
 
 # Model-agnostic manager/worker behavior. Switching providers must not trip
@@ -60,13 +56,6 @@ CONFIG_INVARIANTS = (
     "platform_toolsets:",
     "statem_mcp_server.py",
     "fail_closed_when_active: true",
-    "omp-coding",
-    "glm-codex-effort",
-    "routing_mode: manual",
-    "detached_host:",
-    "detached_command:",
-    "detached_worker_root:",
-    "detached_hard_timeout_seconds: 21600",
     "stale_timeout_seconds: 21600",
     "context_length: 1048576",
     "context_timeout_seconds: 1800",
@@ -80,14 +69,9 @@ EXTERNAL_ASSETS = (
     HERMES_HOME / "statem" / "runbooks",
     HERMES_HOME / "bin" / "lfm25_vl_server.py",
     HERMES_HOME / "bin" / "start-lfm25-vl3b-local.sh",
-    Path.home() / "Library/LaunchAgents/com.hermes.lfm25-vision.plist",
-    OMP,
-    OMP_PLUGIN,
-    OMP_MODELS,
-    OMP_CONFIG,
-    OMP_KEY_READER,
-    OMP_PLUGIN_BUNDLE,
-    OMP_CONFIG_BUNDLE,
+    GLINER_PLUGIN.parent,
+    SYSTEM1_PLUGIN.parent,
+    Path.home() / "Library" / "LaunchAgents" / "com.hermes.lfm25-vision.plist",
 )
 
 
@@ -104,7 +88,7 @@ def _customization_launch_agent_payload() -> dict:
             str(UPDATE_MARKER),
             str(REPO / ".git" / "HEAD"),
             str(REPO / ".git" / "refs" / "heads" / "main"),
-            str(Path.home() / "Library/LaunchAgents/ai.hermes.gateway.plist"),
+            str(Path.home() / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"),
         ],
         "StandardOutPath": str(HERMES_HOME / "customizations" / "logs" / "launchagent.stdout.log"),
         "StandardErrorPath": str(HERMES_HOME / "customizations" / "logs" / "launchagent.stderr.log"),
@@ -205,26 +189,19 @@ def _bundle_integrity(manifest) -> list:
     issues = []
     if manifest.get("overlay_sha256") != _sha256(PATCH):
         issues.append("overlay.patch digest does not match manifest")
-    snapshot_digest = manifest.get("config_snapshot_sha256")
-    if snapshot_digest not in (None, "", "optional"):
-        if snapshot_digest != _sha256(CONFIG_SNAPSHOT):
-            issues.append("config snapshot digest does not match manifest")
+    if manifest.get("config_snapshot_sha256") != _sha256(CONFIG_SNAPSHOT):
+        issues.append("config snapshot digest does not match manifest")
     if not VERIFY.is_file():
         issues.append("verify_overlay.py is missing")
     protected = {
         "controller_sha256": BUNDLE / "reapply.py",
         "verifier_sha256": VERIFY,
         "gateway_entrypoint_sha256": BUNDLE / "gateway_start.py",
-        "omp_plugin_bundle_sha256": OMP_PLUGIN_BUNDLE,
-        "omp_config_bundle_sha256": OMP_CONFIG_BUNDLE,
+        "gliner_extract_sha256": GLINER_PLUGIN,
+        "glm_system1_router_sha256": SYSTEM1_PLUGIN,
     }
     for key, path in protected.items():
-        expected = manifest.get(key)
-        if expected in (None, "", "optional"):
-            continue
-        if key.startswith("omp_") and not path.exists():
-            continue
-        if expected != _sha256(path):
+        if manifest.get(key) != _sha256(path):
             issues.append("{} digest does not match manifest".format(path.name))
     patch_paths = set()
     listed = _git("apply", "--numstat", str(PATCH))
@@ -254,17 +231,7 @@ def _config_audit() -> list:
 
 
 def _external_audit() -> list:
-    optional = {
-        OMP, OMP_PLUGIN, OMP_MODELS, OMP_CONFIG, OMP_KEY_READER,
-        OMP_PLUGIN_BUNDLE, OMP_CONFIG_BUNDLE,
-    }
-    missing = []
-    for path in EXTERNAL_ASSETS:
-        if path in optional and not path.exists():
-            continue
-        if not path.exists():
-            missing.append(str(path))
-    return missing
+    return [str(path) for path in EXTERNAL_ASSETS if not path.exists()]
 
 
 def _bundle_has_revision(bundle: Path, revision: str, cwd: Path) -> bool:
@@ -292,76 +259,6 @@ def _restore_checkout_if_missing(path: Path, bundle: Path, revision: str) -> lis
         )]
     return []
 
-
-def _omp_audit(manifest) -> list:
-    """Fail closed if Desktop's native OMP worker is unavailable or drifted."""
-    if not OMP_PLUGIN_BUNDLE.exists() or not OMP_CONFIG_BUNDLE.exists():
-        _log("OMP recovery bundles not present; skipping OMP safety gate")
-        return []
-    issues = []
-    integration = manifest.get("omp_integration") or {}
-    plugin_revision = str(integration.get("plugin_revision") or "")
-    config_revision = str(integration.get("config_revision") or "")
-    issues.extend(_restore_checkout_if_missing(OMP_PLUGIN, OMP_PLUGIN_BUNDLE, plugin_revision))
-    issues.extend(_restore_checkout_if_missing(OMP_AGENT, OMP_CONFIG_BUNDLE, config_revision))
-    if issues:
-        return issues
-    for bundle, revision, cwd, label in (
-        (OMP_PLUGIN_BUNDLE, plugin_revision, OMP_PLUGIN, "OMP plugin"),
-        (OMP_CONFIG_BUNDLE, config_revision, OMP_AGENT, "OMP config"),
-    ):
-        if not _bundle_has_revision(bundle, revision, cwd):
-            issues.append("{} recovery bundle does not contain approved revision {}".format(label, revision))
-    if not (OMP_PLUGIN / ".git").is_dir():
-        issues.append("OMP plugin is not an independently versioned Git checkout")
-    else:
-        dirty = _git("status", "--porcelain", "--untracked-files=all", cwd=OMP_PLUGIN)
-        if dirty.returncode != 0:
-            issues.append("OMP plugin Git status failed")
-        elif dirty.stdout.strip():
-            _log("OMP plugin has uncommitted local edits; overlay reapply continues")
-        elif _head(OMP_PLUGIN) != plugin_revision:
-            issues.append("OMP plugin revision drift: expected {}, found {}".format(
-                plugin_revision, _head(OMP_PLUGIN)
-            ))
-    if not (OMP_AGENT / ".git").is_dir():
-        issues.append("OMP Desktop configuration is not versioned")
-    else:
-        dirty = _git("status", "--porcelain", "--untracked-files=no", cwd=OMP_AGENT)
-        if dirty.returncode != 0:
-            issues.append("OMP config Git status failed")
-        elif dirty.stdout.strip():
-            issues.append("OMP config has uncommitted drift: " + dirty.stdout.strip()[:500])
-        elif _head(OMP_AGENT) != config_revision:
-            issues.append("OMP config revision drift: expected {}, found {}".format(
-                config_revision, _head(OMP_AGENT)
-            ))
-    try:
-        mode = OMP_KEY_READER.stat().st_mode & 0o777
-        if mode & 0o077:
-            issues.append("OMP credential resolver permissions are too broad ({:o})".format(mode))
-    except OSError as exc:
-        issues.append("OMP credential resolver unreadable: {}".format(exc))
-    if not issues:
-        probe = _run([PYTHON, OMP_PLUGIN / "compatibility.py", "--acp", "--detached"],
-                     cwd=OMP_PLUGIN, timeout=30)
-        if probe.returncode != 0:
-            repair = _run([PYTHON, OMP_PLUGIN / "install_remote.py"],
-                          cwd=OMP_PLUGIN, timeout=240)
-            if repair.returncode == 0:
-                probe = _run(
-                    [PYTHON, OMP_PLUGIN / "compatibility.py", "--acp", "--detached"],
-                    cwd=OMP_PLUGIN, timeout=30,
-                )
-            if probe.returncode != 0:
-                detail = (probe.stderr or probe.stdout).strip()[:1000]
-                repair_detail = (repair.stderr or repair.stdout).strip()[:1000]
-                issues.append(
-                    "OMP ACP/detached compatibility failed after bounded repair: {} / {}".format(
-                        detail, repair_detail
-                    )
-                )
-    return issues
 
 
 def _ensure_customization_service_definition():
@@ -527,11 +424,6 @@ def main() -> int:
         missing_assets = _external_audit()
         if missing_assets:
             return _attention("Required Desktop assets are missing", "; ".join(missing_assets))
-        omp_issues = _omp_audit(manifest)
-        if omp_issues:
-            return _attention("Hermes Desktop OMP integration failed its safety gate",
-                              "; ".join(omp_issues))
-
         reverse = _git("apply", "--reverse", "--check", str(PATCH))
         if reverse.returncode == 0:
             good, detail = _verify(REPO)
@@ -568,7 +460,6 @@ def main() -> int:
             result, config_audit="passed", verification="passed",
             gateway_service=service_detail,
             customization_service=custom_service_detail,
-            omp_acp="passed",
         )
         if result != "already_applied":
             _log("Desktop overlay {} at HEAD {}".format(result, _head()[:12]))

@@ -1,280 +1,332 @@
-# Hermes Agent Optimization: Frontier + StateM harness
+# Hermes Agent Frontier Harness
 
-An update-safe execution harness for Hermes Agent. It is tuned for DeepSeek V4 Flash while remaining useful across local and hosted OpenAI-compatible models, including GLM 5.3 Flash on Spark-style chat templates.
+An update-safe optimization layer for Hermes Agent. It keeps Hermes' native model, tool, skill, memory, desktop, and session features, then adds a bounded execution protocol, durable StateM handoffs, provider-safe request shaping, adaptive GLM reasoning, local GLiNER routing, and recovery guardrails.
 
-This project does not replace Hermes Agent or fork its full source tree. It layers a portable configuration, a fail-closed source overlay, StateM lifecycle support, provider-aware request handling, tool-call hardening, Codex-style GLM effort routing, and an optional local vision adapter over a compatible Hermes installation.
+The goal is not to make every prompt think harder. The goal is to make simple prompts fast, make tool-using work decisive, and make complex or risky work deliberate and verifiable.
 
-The objective is practical agent performance: fewer malformed tool calls, fewer repeated actions, safer recovery after timeouts, better continuity across long tasks, and stronger evidence that the requested work was actually completed.
+This repository is a customization bundle rather than a fork of the full Hermes source tree. It is designed to be applied to a compatible Hermes checkout and safely reconciled after upstream updates.
 
-## At a glance
+## What is native and what is added
 
-| Area | Stock Hermes Agent | This optimized harness |
-| --- | --- | --- |
-| Execution | General agent loop | Bounded prepare, execute, verify, repair, handoff lifecycle |
-| Long tasks | Conversation history and normal session persistence | StateM checkpoints, compact handoffs, fresh-context continuation, independent audit |
-| Tool failures | Provider and model dependent | Argument normalization, ID repair, bounded recovery, repeated-call protection |
-| Timeouts | Retry or provider error handling | Verify-before-retry semantics for potentially completed mutations |
-| Model support | Broad provider support | Broad support plus capability-safe Frontier policy and DSV4-specific tuning |
-| Reasoning | Provider/model configuration | DSV4 max reasoning; GLM keeps thinking on and switches Spark-legal `low`/`high` per request; other models clamp to their wire vocabulary |
-| Observability | Normal logs and status | Bounded phase transitions for provider wait, tools, compaction, interruption, and completion |
-| Updates | Local modifications can drift or be overwritten | Digest-verified overlay that reapplies only when clean and otherwise fails closed |
-| Vision | Provider or computer-use dependent | Optional local LFM2.5-VL auxiliary vision endpoint |
+The following remain native Hermes capabilities:
 
-## Architecture
+- Provider and model selection
+- Chat sessions, desktop UI, TUI, skills, plugins, and normal tool registration
+- Workspace/project context
+- Memory and todo tools
+- Native streaming, checkpoints, and session persistence
+- Native model-specific transports where supported by the upstream version
+
+The following are non-native additions or behavior changes in this harness:
+
+| Addition | What it improves |
+| --- | --- |
+| Frontier execution phases | Keeps long tasks oriented around the next useful action and explicit evidence instead of unbounded narration. |
+| StateM lifecycle and handoffs | Resumes long work from compact durable state rather than replaying a huge, noisy transcript. |
+| Verify-before-retry | Prevents a timeout after a mutation from causing an unsafe duplicate write or duplicate service action. |
+| Tool argument normalization | Repairs common provider/model serialization differences before they become tool failures. |
+| Repetition and no-progress guards | Stops repeated reads, status polling, stale-memory calls, and identical failed actions from consuming the turn. |
+| Adaptive GLM effort routing | Uses low effort for clearly bounded work and high effort when complexity, risk, failure, or an explicit high request warrants it. |
+| GLiNER semantic evidence | Adds a small local classifier signal for routing without sending a second model request. |
+| Fast-turn context compaction | Reduces prefill and improves reusable KV/cache prefixes for short System-1 turns. |
+| Provider wire normalization | Avoids strict-provider 400s caused by empty tool arrays and unsupported request fields. |
+| Empty/partial-response recovery | Preserves an actionable failure explanation and completion state instead of returning a misleading blank result. |
+| Update-safe overlay | Reapplies only known changes after an upstream update and fails closed on conflicts or drift. |
+| Lifecycle observability | Shows bounded provider, tool, verification, repair, compaction, interruption, and completion state without exposing private chain of thought. |
+| Optional local vision adapter | Adds a local OpenAI-compatible LFM2.5-VL path for image inspection without making vision mandatory. |
+
+The harness does not change model weights, create a hidden second agent, or promise that a smaller model has frontier-model capabilities. It improves orchestration, request construction, context selection, and recovery around the selected model.
+
+## Design in one view
 
 ```text
-DeepSeek V4 Flash, GLM 5.3 Flash, or another chat model
-                    |
-                    v
-        Provider-aware transport layer
-                    |
-                    v
-      Frontier + StateM execution harness
-                    |
-                    v
-      GLM Codex-style effort plugin (GLM only)
-                    |
-                    v
-      Native Hermes tools, skills, memory,
-       checkpoints, verification, and UI
+User turn
+   |
+   v
+Turn classification and context selection
+   |                         \
+   |                          +--> GLiNER evidence (local, optional)
+   v
+Adaptive provider request
+   |
+   v
+Frontier execution governor
+   |
+   +--> prepare -> inspect/localize -> act -> verify -> repair -> handoff
+   |                                                     |
+   +--> StateM checkpoint, receipt, clarification, or final result
 ```
 
-DeepSeek-specific behavior stays in the transport and model configuration layers. GLM-specific `low`/`high` thinking stays in `plugins/glm-codex-effort`. The execution protocol and safety controls remain provider-neutral, so OpenRouter models, hosted APIs, local vLLM servers, LM Studio, Ollama, and other OpenAI-compatible endpoints can benefit without receiving unsupported DeepSeek or GLM fields.
+The fast path is intentionally short. A simple prose answer or bounded local action can use compact context, a small tool set, and low reasoning. A complex implementation, failure recovery, risky mutation, or explicit high request can use the full context and high reasoning lane.
 
-Embedding and reranking endpoints are excluded from the agent protocol by default.
+## Non-native feature details
 
-## Key features
+### 1. Frontier execution protocol
 
-### Frontier execution protocol
+The harness adds a bounded execution governor around the normal Hermes turn loop. It represents work as a sequence of evidence-producing phases:
 
-Complex work is guided through a bounded lifecycle:
+1. **Prepare** — identify the workspace, recover only relevant durable state, and establish the task boundary.
+2. **Inspect/localize** — inspect the smallest relevant set of files, processes, or resources.
+3. **Act** — perform the next useful mutation or tool action.
+4. **Verify** — check the result against files, command output, process state, or acceptance criteria.
+5. **Repair** — if verification fails, change strategy rather than repeating the same action.
+6. **Handoff** — write a compact progress packet when context, session, or operator attention is needed.
 
-1. Prepare the workspace and recover relevant state.
-2. Localize the requirement, failure, or target component.
-3. Form a compact plan with explicit success evidence.
-4. Execute only the next useful action.
-5. Verify the result against files, commands, or acceptance criteria.
-6. Repair using a changed strategy when evidence fails.
-7. Write a compact handoff before a context or session boundary.
-8. Finish with a concise result, evidence, and any genuine blocker.
+This improves completion quality by making “I ran a command” different from “the requested state was verified.” It also gives the model a bounded recovery budget and preserves a final-response budget when execution must stop.
 
-This protocol does not add a second hidden agent loop or require extra model calls. It contributes bounded instructions and phase state to the normal Hermes request path.
+### 2. Durable StateM execution
 
-### StateM durable execution
+StateM is used as a durable execution layer for long-running or interruption-prone work. The harness integrates it with the frontier phases rather than treating it as a second chat history.
 
-StateM adds durable state to failure-prone and long-running work:
+Added behavior includes:
 
 - Atomic private checkpoint writes
 - Workspace-aware run isolation
-- Compact phase packets instead of replaying an entire history
+- Machine-readable phase packets
 - Evidence receipts for completed actions
-- Explicit pending clarification and authorization states
-- Fresh-user-turn gating before protected work resumes
-- Durable handoff across sessions and context compaction
-- Repair state that records why the previous strategy failed
+- Pending clarification and authorization states
+- Real-user-turn gating before protected work resumes
+- Compact handoffs across sessions and context compaction
+- Repair records explaining why a previous strategy failed
 - Independent audit before progress is treated as verified
 
-The model can resume from a small, machine-readable contract instead of reconstructing the task from an increasingly noisy transcript.
+The improvement is lower resume cost and less state contamination. A fresh turn can receive the current goal, known facts, pending action, last evidence, and next safe action without replaying tens of thousands of tokens of old tool traffic.
 
-### Verify-before-retry tool effects
+### 3. Verify-before-retry and idempotent effects
 
-Tools that can change files, processes, services, or remote systems are treated as non-atomic effects. If a timeout or interruption happens after dispatch, the operation is recorded as `unknown` until Hermes can reconcile the result.
+Tool effects are not assumed to be atomic. A process launch, file write, service restart, deployment, or remote mutation may complete even when the client sees a timeout or disconnect.
 
-The harness uses stable operation identities and evidence checks to avoid blindly repeating a mutation that may already have succeeded. This is particularly important for shell commands, service restarts, file writes, and remote operations.
+The harness therefore:
 
-### Tool-call normalization and repair
+- Assigns stable operation identities and idempotency keys
+- Records an effect as `unknown` when dispatch may have happened but confirmation is missing
+- Runs reconciliation and verification before replaying an unknown effect
+- Avoids blindly retrying a mutation that may already have succeeded
+- Preserves partial or failed completion metadata for the next turn
 
-The shared tool path handles common differences between OpenAI-compatible providers:
+This reduces duplicate writes, duplicate server starts, repeated deployments, and “retry until it works” behavior that can make a partially successful task worse.
 
-- Missing or null `tool_calls` containers
-- Tuple and list tool-call representations
-- Incrementally streamed names and JSON arguments
+### 4. Tool argument normalization and repair
+
+The provider boundary and tool executor normalize common OpenAI-compatible representation differences, including:
+
+- Tuple/list tool-call representations
+- Incrementally streamed tool names and JSON arguments
 - Nested or aliased argument containers
 - Duplicate or missing tool-call IDs
 - Blank, malformed, or hallucinated tool names
 - Empty calls paired with `finish_reason=tool_calls`
-- Mixed batches containing both valid and invalid calls
+- Mixed valid/invalid batches
 - Incomplete JSON arguments
-- Provider metadata that must be retained or stripped on replay
+- Provider metadata that must be retained or removed during replay
 
-Recovery is bounded. Invalid output is not allowed to create an unlimited repair loop.
+Repair is bounded. A malformed output can be corrected once or classified as a failure; it cannot create an unlimited repair loop.
 
-### Loop and stall protection
+### 5. Repetition, stall, and path-deviation protection
 
-The harness tracks useful progress rather than counting commands alone:
+The harness measures progress, not just the number of tool calls. It detects:
 
-- Cross-turn identical-call detection
+- Identical calls repeated across turns
 - Repeated failure signatures
-- Read-only action streaks
+- Read-only loops such as `read_file` with no resulting change
 - Idempotent no-progress actions
-- Path deviation from the stated task
-- Maximum unproductive-action budgets
-- Bounded repair attempts
-- Final-response budget retained when a guardrail stops execution
+- Stale memory or patch-anchor retries
+- Unchanged process polling
+- Work that has drifted away from the requested path
+- Mute/status/ping loops that never produce a useful user-facing update
 
-When a strategy repeatedly fails, the model receives a concise recovery boundary and must change approach or hand off honestly.
+The response is a concise recovery boundary, a changed strategy, or a truthful handoff. Work tools are allowed a different budget from housekeeping tools, and terminal output retains room for a final explanation.
 
-### DeepSeek V4 Flash 0731 profile
+### 6. Adaptive GLM Codex-style reasoning
 
-The primary profile retains the behavior required by the custom DSV4 endpoint:
+`plugins/glm-codex-effort` adds model-aware `llm_request` middleware for GLM 5.3 Flash deployments whose chat template supports only Spark-legal `low` and `high` reasoning values.
 
-- `reasoning_effort: max`
-- Preservation of structured `reasoning_content`
-- DeepSeek-compatible replay of assistant tool turns
-- Long provider-wait handling without premature cancellation
-- Context-aware Frontier reasoning budgets
-- Completion-token accounting for speculative or buffered output
-- No changes to the separate DeepSeek/vLLM serving recipe
+The router exposes these internal lanes:
 
-The harness improves execution quality and reliability. It does not modify model weights or claim to transform DSV4 into a different underlying model.
+| Lane | Typical use | Context/tools | GLM effort |
+| --- | --- | --- | --- |
+| `fast` | Clearly bounded System-1 prose or a small deterministic action | Compact current-turn context and bounded tools | Thinking off |
+| `standard_compact` | Recovery, overflow, or a compact tool continuation | Compact context and bounded tools | Low |
+| `standard` | Normal agent work | Normal harness context and tools | Low |
+| `full` | Complex planning, architecture, risky work, repeated failure, or explicit high | Full context and tool set | High |
+| `finalize` | The bounded action budget is exhausted and only a result is needed | No tools | Thinking off |
 
-### GLM 5.3 Flash Codex-style effort
+The router also provides:
 
-Spark's GLM chat template only honors `low` and `high`. Any other `reasoning_effort` value becomes max, which is why GLM overthinks when Hermes pins `high` globally.
+- A manual `high` override that remains sticky for the active task
+- Correction away from unnecessary low-lane escalation without demoting active high reasoning
+- Natural-language continuation inheritance
+- Preservation of the active lane across Hermes-generated “continue now” system rows
+- Compact reasoning retained after an initial tool miss
+- `clear_thinking: true` on GLM tool hops so prior reasoning is not needlessly re-deliberated
+- Invalid GLM effort values clamped to supported values rather than falling through to an unintended maximum
+- Provider capability gating so other models do not receive GLM-only fields
 
-`plugins/glm-codex-effort` is a Hermes `llm_request` middleware inspired by Codex, Cursor, and Grok UX:
+“Thinking off” here means the bounded fast/finalization request does not ask GLM for hidden reasoning. It does not disable the agent’s tool protocol, verification, or ordinary user-facing answer.
 
-- Thinking stays **on**. It is never disabled.
-- `reasoning_effort` is rewritten to Spark-legal **`low` or `high` per request**.
-- **High** for plan, repair, escalate, or a clearly hard first turn.
-- **Low** for simple local edits and routine tool hops.
-- Invalid effort is clamped to **low**, never max.
-- `clear_thinking: true` so prior CoT is not re-deliberated on every tool hop.
+The router is semantic and state-aware; it is not a list of special-case keywords. Prompt length, requested outcome, actionability, failure state, risk, tool requirements, explicit effort, and prior active lane all contribute to the decision. The system-generated continuation fix is especially important: a UI “continue” event should resume the active complex lane instead of silently demoting the task to a fast or final lane.
 
-This is a Hermes-side approximation. GLM still thinks on every request; it cannot internally skip think inside `high` the way Grok can without training.
+### 7. GLiNER semantic routing evidence
 
-Copy the plugin to `~/.hermes/plugins/glm-codex-effort` and enable it in `plugins.enabled`. Older Hermes builds that lack `register_system_prompt_section` still apply the wire rewrite; they just skip the extra prompt section.
+`plugins/gliner-extract` supplies a pre-warmed local GLiNER classifier for lightweight semantic evidence. It classifies a request into categories such as:
 
-### Cross-model capability safety
+- `quick_response`
+- `bounded_operation`
+- `complex`
+- `risk`
+- `ambiguous`
 
-The Frontier protocol applies to chat-capable models by default. Provider-specific request fields remain gated by the existing Hermes transport logic:
+The result is evidence for the GLM router, not a replacement for the LLM. It runs locally, uses request-local inputs, and falls back to the normal harness path if the optional dependency or model is unavailable.
 
-- Reasoning effort is clamped to each wire vocabulary.
-- Gemini thinking configuration is emitted only for Gemini models.
-- Gemini thought signatures are removed before replay to strict non-Gemini providers.
-- Unsupported reasoning fields are not assumed for plain local endpoints.
-- DeepSeek reasoning metadata remains separate from OpenRouter reasoning details.
-- Empty tool-call arrays are removed for strict providers that reject them.
+Attached URL/file context is excluded from the routing text while remaining available to the model. This prevents a large pasted document, URL, or image description from being mistaken for a complex user intent merely because it increases input length.
 
-This lets weaker or less agent-specialized models benefit from the execution discipline without forcing one provider's schema onto another.
+The trade-off is a one-time startup/prewarm cost. After prewarm, the per-request classification is intended to be much cheaper than an additional LLM routing call. GLiNER is therefore used for fast semantic evidence, while the selected model remains responsible for the actual answer and tool plan.
 
-### Bounded reasoning disclosure
+### 8. Prefill, context, KV, and cache behavior
 
-The desktop integration can show concise lifecycle information such as provider wait, tool execution, verification, repair, compaction, interruption, and terminal completion.
+Fast turns use a self-contained, stable prefix and compact current-turn context. When continuity is required, the harness can retain conversational endpoints and relevant evidence without replaying every intermediate trace.
 
-It does not expose private chain-of-thought. The UI surfaces phase, action, evidence, and blocker summaries that are useful for diagnosing a stalled session.
+This improves:
 
-### Optional local vision
+- Prefill latency on short System-1 prompts
+- Prefix stability for provider-side KV or response caching
+- Token cost and input-token variance across tool hops
+- Recovery from a large or contaminated prior session
 
-The repository includes an OpenAI-compatible adapter for `LiquidAI/LFM2.5-VL-3B-MLX-8bit`. It can provide a small local auxiliary vision path without sending images to OpenRouter or forcing the agent to open Chrome for ordinary image inspection.
+The harness does not promise cache hits: cache eligibility and keying remain provider-specific. It improves the chance of reuse by avoiding unnecessary prefix churn and by keeping fast-turn requests self-contained.
 
-Model weights are intentionally not included.
+### 9. Provider wire safety and empty-tool handling
 
-## Update safety
+Some strict OpenAI-compatible providers reject `tools: []`, while others accept or ignore it. The harness normalizes the final request at the wire boundary and after SDK request transformation:
 
-The customization bundle is designed to survive Hermes updates without restoring stale code wholesale.
+- Omit genuinely empty top-level tool arrays
+- Omit empty tool arrays nested in provider request bodies
+- Preserve a valid placeholder when another request layer carries non-empty tools
+- Avoid unsupported GLM or reasoning fields on providers that do not advertise them
+- Preserve valid tool payloads and tool-only turns
 
-- `overlay.patch` contains only the owned source differences.
-- `manifest.json` records the expected SHA-256 overlay digest and preserved capabilities.
-- `reapply.py` checks whether an update is active before touching the checkout.
-- A reverse patch check detects when the overlay is already present.
-- A forward patch check must succeed before any source is changed.
-- Configuration invariants and external StateM/vision assets are audited separately.
-- Conflicts create `NEEDS_ATTENTION` and leave upstream source untouched.
-- No reset, checkout, stash restore, or broad configuration overwrite is performed.
+This fixes a class of HTTP 400 errors such as: “`tools` must not be an empty array.” It does not fix authentication, quota, upstream outage, malformed credentials, or a provider that rejects a different field.
 
-The result is fail-closed update handling: upstream changes are preserved, and ambiguous customization drift requires reconciliation instead of silently reviving stale patches.
+The SDK transform bypass also avoids an expensive typed walk for large provider payloads while preserving the intended wire format. This can reduce model-call overhead on very large conversations, but it is guarded by regression tests and final request normalization.
 
-## Recorded benchmark results
+### 10. Empty, partial, and reasoning-only response recovery
 
-The following baseline was recorded on 2026-08-21 using `deepseek-v4-flash-0731` with reasoning set to `max`.
+The response path distinguishes a real empty provider response from a completed tool turn, a reasoning-only response, an interrupted turn, and a provider failure. It uses bounded retry/cost rules and retains visible failure or partial-completion metadata.
 
-### Long-horizon diagnostic
+The improvement is diagnosability: a provider failure should not look like a successful blank answer, and a tool turn should not be mistaken for a finished user response. Provider authentication errors still need provider configuration to be corrected.
 
-| Metric | Result |
-| --- | ---: |
-| Final verified requirements | **24 / 24** |
-| Verified completion rate | **100%** |
-| Fresh-context rounds | **3** |
-| API calls | **146** |
-| Provider errors | **0** |
-| Runner timeouts | **0** |
-| Guardrail events | **0** |
+### 11. Lifecycle observability and UI behavior
 
-The task required implementation across three fresh-context rounds, durable handoffs, and an independent grader. Only auditor-passed requirements counted as progress.
+The overlay adds bounded lifecycle state for:
 
-This is a custom harness diagnostic. It is not a standardized Terminal-Bench or Long-Horizon Terminal-Bench score and should not be presented as one.
+- Provider wait and recovery
+- Tool execution
+- Verification and repair
+- Context compaction
+- Interruption and stale-turn fencing
+- Completion and partial completion
 
-### Served-model perplexity diagnostic
+Desktop-facing changes prefer concise status and evidence summaries. They do not expose private chain of thought. The update-safe bundle also includes the reasoning disclosure preference and provider-wait test fixes needed to keep the UI truthful about whether generation is active, waiting, recovering, or complete.
 
-| Metric | Result |
-| --- | ---: |
-| Chat-conditioned perplexity | **5.0319** |
-| Scored WikiText-2 content tokens | **22,458** |
-| Repeat-run perplexity | **5.0263** |
+### 12. Optional local LFM2.5-VL vision adapter
 
-The score uses vLLM prompt log-probabilities with the fixed chat-template prefix and suffix subtracted. It is useful for regression comparison of this serving recipe, but it is not directly interchangeable with untemplated base-model perplexity.
+The `bin/` scripts provide an optional OpenAI-compatible local adapter for `LiquidAI/LFM2.5-VL-3B-MLX-8bit`. It can support ordinary image inspection without routing every image to a hosted provider or forcing a browser workflow.
 
-### Buffered single-stream timing diagnostic
+The adapter is auxiliary. It is not required for the frontier harness, and model weights are not included in this repository.
 
-| Metric | Result |
-| --- | ---: |
-| Median time to first token | **20.51 s** |
-| Median effective throughput | **37.44 tokens/s** |
-| Mean effective throughput | **37.93 tokens/s** |
-| Measured completions | **3 x 768 tokens** |
+### 13. Update-safe source overlay
 
-The endpoint buffered the streamed response, so a valid steady-state decode rate was not available. These figures describe end-to-end effective throughput and must not be represented as raw vLLM decode speed. Timing comparisons are invalid when other workers share the serving endpoint.
+The customization is shipped as an explicit overlay instead of a silent fork:
 
-## What the scores do and do not mean
+- `overlay.patch` contains owned source differences
+- `manifest.json` records provenance, capability claims, and SHA-256 digests
+- `reapply.py` detects active updates before touching the checkout
+- Reverse checks detect an already-applied overlay
+- Forward checks must pass before source changes are made
+- Three-way application fails closed on conflicts
+- Configuration invariants and external runtime assets are audited separately
+- No wholesale reset, checkout, stash restore, or broad configuration overwrite is performed
 
-The results support the claim that the harness can complete the included long-horizon task with durable state, verification, and no recorded provider or guardrail failures in the baseline run.
-
-They do not prove parity with a frontier closed model, universal performance across repositories, or a standardized terminal-agent benchmark result. Model quality, serving configuration, context length, endpoint load, quantization, and task design remain important variables.
-
-Perplexity, execution success, and throughput are deliberately reported separately rather than merged into a synthetic intelligence score.
-
-## Repository contents
-
-- `config/config.example.yaml`: redacted multi-provider Hermes configuration template
-- `customizations/frontier-harness/overlay.patch`: Frontier, StateM, tool, commentary-gate, and lifecycle source overlay for Hermes **0.21.1**
-- `customizations/frontier-harness/reapply.py`: fail-closed update reapplication controller
-- `customizations/frontier-harness/verify_overlay.py`: offline overlay marker and import verification
-- `customizations/frontier-harness/gateway_start.py`: launchd entrypoint that refuses to start if the compatibility gate fails
-- `customizations/frontier-harness/manifest.json`: capability, provenance, and integrity manifest
-- `plugins/glm-codex-effort`: Codex-style GLM `low`/`high` thinking plugin and offline tests
-- `bin/hermes-statem`: portable StateM launcher
-- `bin/lfm25_vl_server.py`: local OpenAI-compatible LFM vision adapter
-- `bin/start-lfm25-vl3b-local.sh`: local MLX vision service launcher
-- `.env.example`: empty environment-variable placeholders
-
-Live machine paths, Spark hostnames, OMP recovery git bundles, `config.snapshot.yaml`, session data, and API keys stay local. The GitHub copy is sanitized.
-
-## Security and portability
-
-This repository intentionally excludes:
-
-- API keys and authentication files
-- Private endpoint addresses
-- SSH hosts and network topology
-- Usernames and machine-specific workspace paths
-- Chat history and session databases
-- Logs, checkpoints, and StateM run data
-- Model weights and local caches
-- Launch-agent files
-- The installed Hermes source checkout
-
-All credentials and private endpoint values must be supplied locally through environment variables. Never commit the real `~/.hermes/config.yaml`, `.env`, `auth.json`, session data, or model cache.
+When upstream changes overlap with a customization, the correct result is `NEEDS_ATTENTION`, not silently reapplying stale code. This keeps upstream fixes and the local overlay reviewable.
 
 ## Installation outline
 
-1. Install the compatible upstream Hermes Agent version.
-2. Copy `.env.example` to an untracked `.env` and provide local values.
-3. Adapt `config/config.example.yaml` without committing private endpoint information.
-4. Place the customization bundle under the local Hermes customization directory.
-5. Copy `plugins/glm-codex-effort` to `~/.hermes/plugins/glm-codex-effort` when using GLM 5.3.
-6. Apply the overlay only when its clean-check succeeds.
-7. Install StateM and the optional LFM vision dependencies separately.
-8. Restart Hermes and verify the selected model, normal tools, checkpointing, and provider path.
+1. Install a compatible upstream Hermes Agent checkout. The current bundle records the reconciled upstream version in `customizations/frontier-harness/manifest.json`.
+2. Copy `.env.example` to an untracked `.env` only if local environment values are needed.
+3. Adapt `config/config.example.yaml` locally without committing private endpoints, API keys, or session data.
+4. Place `customizations/frontier-harness` in the local Hermes customization directory.
+5. Install the tracked plugins under `~/.hermes/plugins` or use the repository's plugin installation workflow:
 
-Review `NEEDS_ATTENTION` after every Hermes update. Do not force an overlay across an upstream conflict.
+   ```text
+   plugins/glm-codex-effort
+   plugins/gliner-extract
+   ```
+
+6. Install the optional GLiNER dependencies from `plugins/gliner-extract/requirements.txt` if semantic routing is desired.
+7. Install StateM and optional LFM vision dependencies separately when those capabilities are desired.
+8. Run the verifier before and after applying the overlay. Resolve `NEEDS_ATTENTION` rather than forcing the patch across an upstream conflict.
+9. Restart Hermes and verify the selected model, normal tools, provider path, checkpoints, and GLM routing behavior.
+
+The bundle is update-safe, not update-automatic: after each Hermes update, run the verifier and review any changed source or configuration before reapplying.
+
+## Verification
+
+The plugin tests are offline and do not make model calls:
+
+```bash
+python -m pytest -q \
+  plugins/glm-codex-effort/test_glm_codex_effort.py \
+  plugins/gliner-extract/test_gliner_extract.py
+```
+
+The installed checkout verifier is run against the local Hermes source tree, not this documentation repository:
+
+```bash
+python customizations/frontier-harness/verify_overlay.py \
+  --repo "$HERMES_HOME/hermes-agent"
+```
+
+The expected overlay, verifier, GLM router, and GLiNER digests are recorded in the manifest. The current bundle was regression-tested with focused and broader adaptive-harness suites before publication.
+
+## Repository contents
+
+- `customizations/frontier-harness/overlay.patch` — owned Hermes source overlay
+- `customizations/frontier-harness/reapply.py` — transactional, fail-closed update controller
+- `customizations/frontier-harness/verify_overlay.py` — offline marker/import/digest verifier
+- `customizations/frontier-harness/gateway_start.py` — compatibility-gated launcher
+- `customizations/frontier-harness/manifest.json` — provenance, capability, and integrity manifest
+- `plugins/glm-codex-effort/` — adaptive GLM lanes, continuation inheritance, and offline tests
+- `plugins/gliner-extract/` — optional local semantic routing evidence and offline tests
+- `config/config.example.yaml` — redacted configuration template
+- `bin/hermes-statem` — portable StateM launcher
+- `bin/lfm25_vl_server.py` — optional local vision adapter
+- `bin/start-lfm25-vl3b-local.sh` — optional local MLX vision launcher
+- `.env.example` — empty environment-variable placeholders
+
+No OMP integration or OMP dependency is included in this harness. No session data, logs, private configuration, credentials, model weights, launch-agent files, or installed Hermes checkout is published.
+
+## Security and portability
+
+Never commit:
+
+- API keys, OAuth tokens, authentication files, or private provider URLs
+- Real `~/.hermes/config.yaml` or `.env` files
+- Session databases, chat history, logs, checkpoints, or StateM run data
+- Usernames, machine-specific paths, SSH hosts, or network topology
+- Model weights or local caches
+- Launch-agent files
+
+The public bundle uses portable placeholders such as `$HERMES_HOME`, `$HOME`, and `$HF_HOME` for external assets. The local installation supplies actual paths at runtime.
+
+## Scope and limitations
+
+- GLiNER is optional evidence, not a guarantee that every prompt is classified correctly.
+- Adaptive routing reduces avoidable reasoning and context cost; it cannot remove model latency caused by a slow provider or overloaded endpoint.
+- A fast lane does not bypass tool safety, verification, authorization, or provider error handling.
+- High reasoning is intentionally sticky for complex or explicitly high work until the task reaches a safe boundary.
+- Provider authentication, quota, outage, and model availability errors still require provider-side fixes.
+- Benchmark numbers, when present in project history, are diagnostic measurements for specific hardware, models, and workloads; they are not standardized benchmark claims.
+
+## License and upstream relationship
+
+This repository is a customization bundle for Hermes Agent. Review the upstream Hermes Agent license and the licenses of optional dependencies before redistribution. Upstream source remains the source of truth for the base agent; this repository documents and carries only the overlay and auxiliary integration artifacts.

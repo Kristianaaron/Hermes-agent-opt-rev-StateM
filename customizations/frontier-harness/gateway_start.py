@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 HOME = Path.home()
-HERMES = Path(os.environ.get("HERMES_HOME", str(HOME / ".hermes")))
+HERMES = Path(os.environ.get("HERMES_HOME", str(HOME / ".hermes"))).expanduser()
 AGENT = HERMES / "hermes-agent"
 REAPPLY = HERMES / "customizations" / "frontier-harness" / "reapply.py"
 PYTHON = AGENT / "venv" / "bin" / "python"
