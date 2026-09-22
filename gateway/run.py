@@ -2014,6 +2014,13 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
             continue
         _val = _terminal_cfg[_cfg_key]
         if _cfg_key == "cwd":
+            # This module is also imported by local CLI one-shots while building
+            # their agent. Its import-time gateway bridge must not undo --in.
+            if _terminal_backend == "local":
+                from agent.runtime_cwd import explicit_cli_cwd
+
+                if explicit_cli_cwd():
+                    continue
             # Placeholders (".", "auto", "cwd") resolve to Path.home() later; only explicit paths bridge.
             if str(_val) in {".", "auto", "cwd"}:
                 continue

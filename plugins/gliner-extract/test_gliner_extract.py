@@ -174,6 +174,11 @@ def test_synthetic_recovery_nudge_does_not_replace_user_prompt():
     assert gliner_extract._latest_user_text(messages) == "Start the server"
 
 
+def test_user_text_beginning_with_system_label_is_still_user_text():
+    prompt = "[System: Please fix the draft release note]"
+    assert gliner_extract._latest_user_text([{"role": "user", "content": prompt}]) == prompt
+
+
 def test_latest_user_text_excludes_expanded_attached_url_context():
     instruction = "Change the PDP images using the referenced page"
     messages = [{

@@ -364,7 +364,8 @@ def test_bounded_edit_forces_mutation_tools_after_three_reads(monkeypatch):
     )
     names = {_tool["function"]["name"] for _tool in out["request"]["tools"]}
     assert names == {"patch", "write_file"}
-    assert "Do not read or search again" in out["request"]["messages"][0]["content"]
+    assert "read_file" not in names
+    assert "Do not inspect again" in out["request"]["messages"][0]["content"]
 
 
 def test_discovery_rounds_do_not_consume_fast_action_budget(monkeypatch):
@@ -650,10 +651,10 @@ def test_explicit_edit_can_finalize_after_a_mutation_tool_lands(monkeypatch):
 
     assert out["request"].get("tool_choice") != "required"
     assert out["reason"].startswith("verify_compact:")
-    assert "at most one proportional verification" in out["request"]["messages"][0]["content"]
+    assert "which parts of the user's request are complete" in out["request"]["messages"][0]["content"]
 
 
-def test_edit_finalizes_after_one_post_mutation_read(monkeypatch):
+def test_edit_keeps_tools_after_one_post_mutation_read(monkeypatch):
     monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
     req = request("Make the step headings a bit thinner")
     req["messages"].extend([
@@ -679,9 +680,11 @@ def test_edit_finalizes_after_one_post_mutation_read(monkeypatch):
         request=req, model=req["model"], api_call_count=3, turn_id="t-edit-verified"
     )
 
-    assert "tools" not in out["request"]
+    assert {"patch", "write_file"} <= {
+        tool["function"]["name"] for tool in out["request"]["tools"]
+    }
     assert out["request"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
-    assert "verification attempted; finalize" in out["reason"]
+    assert "assess remaining work" in out["reason"]
 
 
 def test_failed_write_is_not_treated_as_a_landed_edit(monkeypatch):
@@ -717,8 +720,7 @@ def test_failed_write_is_not_treated_as_a_landed_edit(monkeypatch):
     )
 
     names = {tool["function"]["name"] for tool in out["request"]["tools"]}
-    assert names <= {"patch", "write_file"}
-    assert names
+    assert {"patch", "write_file", "read_file"} <= names
     assert out["request"]["tool_choice"] == "required"
     assert "latest edit/verification failed; keep recovery tools available" in out["reason"]
     assert "finalize" not in out["reason"]
@@ -849,6 +851,39 @@ def test_empty_finalize_recovery_reopens_reasoning_but_not_tools(monkeypatch):
     assert out["reason"].startswith("finalize_reasoning:empty finalization recovery")
 
 
+def test_tools_off_finalize_reopens_when_the_stall_nudge_asks_for_action(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    nudge = (
+        "[System: Continue now. Execute the required tool calls and only send your "
+        "final answer after completing the task.]"
+    )
+    req = request("Decrease the step header weights from 700 to 500")
+    req["messages"] = [
+        {"role": "user", "content": "Decrease the step header weights from 700 to 500"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "p",
+                "type": "function",
+                "function": {"name": "patch", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "p", "content": "patched"},
+        {"role": "assistant", "content": "I'll keep adjusting the headers."},
+        {"role": "user", "content": nudge, "display_kind": "hidden"},
+    ]
+    router._TURN_LANES["t-reopen"] = ("finalize_reasoning", router.time.monotonic())
+
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=8, turn_id="t-reopen"
+    )
+
+    names = {item["function"]["name"] for item in out["request"]["tools"]}
+    assert "patch" in names
+    assert "restore tools" in out["reason"]
+
+
 def test_system_continue_does_not_demote_active_reasoning_lane(monkeypatch):
     monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
     req = request("[System: Continue now. Execute the required tool calls and only send your final answer after completing the task.]")
@@ -878,3 +913,271 @@ def test_chat_template_off_is_really_off():
         "enable_thinking": False,
         "clear_thinking": True,
     }
+
+
+@pytest.mark.parametrize("prompt", [
+    "Rename the export button to Save",
+    "Decrease the step header weights from 700 to 500",
+])
+def test_any_action_request_stops_inspection_without_classifier_intent(monkeypatch, prompt):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence",
+        lambda: evidence("fast", "quick_response", 0.9, mutation_intent=False),
+    )
+    req = request(prompt)
+    for index, name in enumerate(("search_files", "read_file", "search_files"), start=1):
+        req["messages"].extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": str(index), "type": "function",
+                    "function": {"name": name, "arguments": '{"query":"item-%d"}' % index},
+                }],
+            },
+            {"role": "tool", "tool_call_id": str(index), "content": '{"ok":true,"n":%d}' % index},
+        ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=4, turn_id="t-action-gate"
+    )
+    names = {_tool["function"]["name"] for _tool in out["request"]["tools"]}
+    assert names == {"patch", "write_file"}
+    assert "read_file" not in names
+    assert out["request"]["tool_choice"] == "required"
+    assert "Do not inspect again" in out["request"]["messages"][0]["content"]
+
+
+def test_process_action_keeps_terminal_after_inspection(monkeypatch):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence",
+        lambda: evidence("fast", "quick_response", 0.9, mutation_intent=False),
+    )
+    req = request("Restart the preview server")
+    for index, name in enumerate(("search_files", "read_file", "search_files"), start=1):
+        req["messages"].extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": str(index), "type": "function",
+                    "function": {"name": name, "arguments": '{"query":"proc-%d"}' % index},
+                }],
+            },
+            {"role": "tool", "tool_call_id": str(index), "content": '{"ok":true,"n":%d}' % index},
+        ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=4, turn_id="t-process-gate"
+    )
+    names = {_tool["function"]["name"] for _tool in out["request"]["tools"]}
+    assert "terminal" in names
+    assert "read_file" not in names
+    assert "search_files" not in names
+
+
+@pytest.mark.parametrize("followup", [
+    "what did you do?",
+    "why did you stop?",
+])
+def test_turn_meta_answers_about_original_request_without_replaying_it(monkeypatch, followup):
+    monkeypatch.setattr(
+        router, "_consume_gliner_evidence",
+        lambda: evidence("fast", "quick_response", 0.95, mutation_intent=False),
+    )
+    original = "Rename the export button to Save"
+    req = request(followup)
+    req["messages"] = [
+        {"role": "system", "content": "large system\nCurrent working directory: /tmp/ui\n"},
+        {"role": "user", "content": original},
+        {"role": "assistant", "content": "I only listed files and did not make the change."},
+        {"role": "user", "content": followup},
+    ]
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=1, turn_id="t-turn-meta"
+    )
+    compact = out["request"]["messages"]
+    assert any(message.get("content") == original for message in compact)
+    assert "tools" not in out["request"]
+    assert out["request"].get("tool_choice") != "required"
+
+
+def test_quoting_the_previous_reply_is_not_a_new_task(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    original = "Rename the export button to Save"
+    reply = "I opened the workspace, listed the components, and stopped before editing anything."
+    req = request("You said this\n\n" + reply)
+    req["messages"] = [
+        {"role": "system", "content": "large system"},
+        {"role": "user", "content": original},
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": "You said this\n\n" + reply},
+    ]
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=1, turn_id="t-quoted-reply"
+    )
+    prompt = out["request"]["messages"][0]["content"]
+    assert "Answer questions about the previous turn" in prompt
+    assert original in [message.get("content") for message in out["request"]["messages"]]
+    assert "tools" not in out["request"]
+
+
+@pytest.mark.parametrize("prompt,expected", [
+    ("Please review this module and fix any errors", {"file"}),
+    ("Don't change the API; update the implementation", {"file"}),
+    ("Fix the bug without changing the API", {"file"}),
+    ("Update the title and then run tests", {"file", "process"}),
+    ("Stop the preview server", {"process"}),
+    ("Stop now", set()),
+    ("Review this without changing anything", set()),
+    ("Review only; do not implement it", set()),
+    ("Just explain how to fix this", set()),
+    ("Just inspect the code, then fix the bug", {"file"}),
+    ("Explain how to fix this", set()),
+])
+def test_mixed_instruction_intent(prompt, expected):
+    assert router.requested_action_kinds(prompt) == expected
+
+
+@pytest.mark.parametrize("result", ['{"exit_code":0}', '{"exit_code":1}'])
+def test_process_result_releases_required_tool_gate(monkeypatch, result):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Run the test suite")
+    req["messages"].extend([
+        {"role": "assistant", "tool_calls": [{
+            "id": "run", "type": "function",
+            "function": {"name": "terminal", "arguments": '{"command":"pytest"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "run", "content": result},
+    ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=2,
+        turn_id="t-process-result-" + result,
+    )
+    assert out["request"].get("tool_choice") != "required"
+    assert "terminal" in {tool["function"]["name"] for tool in out["request"]["tools"]}
+
+
+def test_process_inspection_does_not_count_as_running_task(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Run the test suite")
+    req["messages"].extend([
+        {"role": "assistant", "tool_calls": [{
+            "id": "inspect", "type": "function",
+            "function": {"name": "terminal", "arguments": '{"command":"pwd"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "inspect", "content": '{"exit_code":0,"output":"/tmp/project"}'},
+    ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=2, turn_id="t-process-inspection"
+    )
+    assert out["request"]["tool_choice"] == "required"
+
+
+def test_mixed_action_gate_retains_edit_and_process_tools_after_inspection(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Update the title and run tests")
+    for index in range(3):
+        call_id = str(index)
+        req["messages"].extend([
+            {"role": "assistant", "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"a.tsx"}'},
+            }]},
+            {"role": "tool", "tool_call_id": call_id, "content": "source"},
+        ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=4, turn_id="t-mixed-inspection"
+    )
+    names = {tool["function"]["name"] for tool in out["request"]["tools"]}
+    assert {"patch", "terminal"} <= names
+    assert "read_file" not in names
+
+
+def test_partial_multifile_edit_remains_actionable(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Update all four headings in two files and run tests")
+    req["messages"].extend([
+        {"role": "assistant", "tool_calls": [{
+            "id": "edit", "type": "function",
+            "function": {"name": "patch", "arguments": '{"path":"a.tsx"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "edit", "content": '{"success":true}'},
+        {"role": "assistant", "tool_calls": [{
+            "id": "read", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"a.tsx"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "read", "content": "heading one looks good"},
+    ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=3, turn_id="t-partial-multifile"
+    )
+    assert {"patch", "terminal"} <= {
+        tool["function"]["name"] for tool in out["request"]["tools"]
+    }
+    assert out["request"]["tool_choice"] == "required"  # Tests are still pending.
+    assert "which parts of the user's request are complete" in out["request"]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("decision", ["fast", "full"])
+def test_completed_action_is_not_replayed_for_followup_question(monkeypatch, decision):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence(decision, "quick_response", .9, mutation_intent=False))
+    req = request("What did you do?")
+    req["messages"] = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Remove the generated report"},
+        {"role": "assistant", "content": "Done. Removed the generated report."},
+        {"role": "user", "content": "What did you do?"},
+    ]
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=1, turn_id="t-done-question-" + decision
+    )
+    assert router._routing_user_text(req["messages"]) == "What did you do?"
+    assert "tools" not in out["request"]
+
+
+def test_quoted_imperative_is_evidence_not_instruction(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    reply = "I updated one file. Fix the remaining files and run the tests before answering."
+    req = request("You said this\n\n" + reply)
+    req["messages"] = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Update all files"},
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": "You said this\n\n" + reply},
+    ]
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=1, turn_id="t-quoted-imperative"
+    )
+    assert router._routing_user_text(req["messages"]) == "You said this"
+    assert "tools" not in out["request"]
+
+
+def test_real_system_prefixed_user_message_is_not_discarded():
+    message = {"role": "user", "content": "[System: Please fix the draft release note]"}
+    assert router._is_synthetic_user(message) is False
+    assert router._routing_user_text([message]) == message["content"]
+
+
+def test_post_action_budget_exits_with_honest_status(monkeypatch):
+    monkeypatch.setattr(router, "_consume_gliner_evidence", lambda: evidence())
+    req = request("Update the headings")
+    req["messages"].extend([
+        {"role": "assistant", "tool_calls": [{
+            "id": "edit", "type": "function",
+            "function": {"name": "patch", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "edit", "content": '{"success":true}'},
+    ])
+    out = router.on_llm_request(
+        request=req, model=req["model"], api_call_count=25, turn_id="t-post-action-budget"
+    )
+    assert "tools" not in out["request"]
+    assert "State any unfinished work" in out["request"]["messages"][0]["content"]
+
+
+def test_compacted_terminal_output_keeps_final_test_summary(monkeypatch):
+    monkeypatch.setattr(router, "_setting", lambda key, default: 100 if key == "fast_tool_result_chars" else default)
+    output = "START\n" + ("verbose test output\n" * 30) + "FAILED: 2 tests\n"
+    compact = router._compact_message({"role": "tool", "content": output})
+    assert compact["content"].startswith("START")
+    assert compact["content"].endswith("FAILED: 2 tests\n")
+    assert "middle omitted" in compact["content"]

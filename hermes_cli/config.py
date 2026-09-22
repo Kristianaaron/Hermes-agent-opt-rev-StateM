@@ -2157,6 +2157,15 @@ def apply_terminal_config_to_env(
                 value = os.path.expanduser(value)
         if (should_override and cfg_key in explicit_keys) or env_var not in target:
             target[env_var] = _terminal_env_value(value)
+    # --in is an explicit CLI workspace choice. A later dotenv reload calls this
+    # bridge during run_agent import; config.yaml's terminal.cwd must not move
+    # that one-shot/chat session back into another project.
+    if env is None and terminal_backend == "local":
+        from agent.runtime_cwd import explicit_cli_cwd
+
+        pinned = explicit_cli_cwd()
+        if pinned:
+            target["TERMINAL_CWD"] = pinned
     return target
 
 

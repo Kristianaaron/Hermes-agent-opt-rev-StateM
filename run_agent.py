@@ -1266,8 +1266,9 @@ class AIAgent(
         if decision.code == "read_only_streak_halt":
             return (
                 "I didn't complete the requested change. I inspected the workspace repeatedly "
-                "without making an edit, so Hermes stopped the loop. No additional action was "
-                "taken; the harness needs a different execution path, not another `continue`."
+                "without doing the requested action, so Hermes stopped the loop. That request "
+                "is still unfinished. Do the action directly; do not search again or create a "
+                "file that only describes this stop."
             )
         if decision.code == "total_tool_call_cap":
             return (

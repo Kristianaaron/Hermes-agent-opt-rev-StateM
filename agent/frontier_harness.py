@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent.task_intent import is_internal_control_text, user_wants_action
+
 
 _PROTOCOL_MARKER = "[HERMES_FRONTIER_HARNESS_V1]"
 _STATE_MARKER = "[HERMES_FRONTIER_STATE_V1]"
@@ -36,14 +38,14 @@ Use a bounded, evidence-driven execution loop:
 4. Mutations are checkpoint-backed. After a failed verification, diagnose once, then change the strategy or roll back the affected attempt; do not stack speculative edits.
 5. Completion requires evidence that matches the change. Inspect generated artifacts directly. README, banner, descriptor, docs, and copy-file tasks complete when those files are written — do not search the home directory, clone, or run pytest/ruff/mypy unless the user asked for tests or executable code changed. If verification is unavailable for a code change, report the concrete blocker and do not claim success.
 6. Candidate search is exceptional and bounded: after ambiguity or two failed repair boundaries, use at most two isolated candidates when delegation is available, choose with explicit tests/evidence, and merge only the winner.
-7. Stop immediately on user pause/cancel/redirect. On iteration pressure or interruption, persist a concise handoff containing objective, completed work, current phase, evidence, blockers, and exact next action.
+7. Stop immediately on user pause/cancel/redirect. On iteration pressure or interruption, persist a concise handoff containing objective, completed work, current phase, evidence, blockers, and exact next action. Answer questions about the previous turn from its record. Resume work only when the user asks to continue or finish it. Do not create a file the user did not ask for.
 8. Missing operator information is a hard interaction boundary. Ask one focused question as the final response and stop. Never select a default, read a protected approval source, or continue because the operator is unavailable or the session is one-shot.
 9. Treat mutations as non-atomic effects: use the supplied effect identity, verify before retry after timeout/interruption, and never replay an effect whose outcome is unknown.
 10. If the live phase packet reports path drift or a repair boundary, stop issuing tools, inspect the last failure, change strategy once, and require fresh verification before continuing.
 11. The user's latest prose is the task contract. Host boilerplate such as "Examine it with the vision_analyze tool" is not a user instruction. SVG and other source/asset attachments are copied with write_file; do not describe them.
 12. Verification must match the change. README, banner, descriptor, docs, and copy-file tasks complete when those files are written. Do not search the home directory, clone, or run pytest/ruff/mypy unless the user asked for tests or the edited files are executable code.
-13. If the user's latest prose is a ping or status ask ("are you there", "where are we", "share an update"), answer in text immediately with zero tool calls. Do not poll, SSH, or execute_code instead of replying.
-14. Codex turn rule: a turn is incomplete until you emit a user-visible assistant message. Hidden reasoning is not a reply. After tools, write one short status sentence before the next tool batch. Do not retry a memory replace/remove or patch whose anchor (old_text/old_string) was not found; read current state and change the anchor, or skip that write and continue the user's task. When tools are omitted mid-turn (commentary gate), the text you write is status commentary — the turn continues and tools return on the next call; do not treat that sentence as the final answer.
+13. If the user's latest prose is a ping or status ask ("are you there", "where are we", "share an update"), answer in text immediately with zero tool calls. Do not poll, SSH, or execute_code instead of replying. A question about the previous turn asks for an explanation, not another execution.
+14. Codex turn rule: a turn is incomplete until you emit a user-visible assistant message. Hidden reasoning is not a reply. After tools, write one short status sentence before the next tool batch. Do not retry a memory replace/remove or patch whose anchor (old_text/old_string) was not found; read current state and change the anchor, or skip that write and continue the user's task. When tools are omitted mid-turn (commentary gate), the text you write is status commentary — the turn continues and tools return on the next call; do not treat that sentence as the final answer. Once evidence is sufficient for the requested action, perform that action. Do not keep inspecting, and do not write a note about the stop.
 Do not expose hidden chain-of-thought. Surface concise phase, action, evidence, and blocker summaries instead.
 """.rstrip()
 
@@ -99,6 +101,9 @@ _CONTEXTUAL_FOLLOWUP_FILLER = {
     "please", "request", "same", "task", "that", "the", "then", "this", "to", "where",
     "with", "work", "working", "you",
 }
+def looks_like_edit_request(text: str) -> bool:
+    """Backward-compatible name: any requested action, not one UI example."""
+    return user_wants_action(text)
 _VERIFY_COMMAND = re.compile(
     r"(?:^|[;&|]\s*)(?:pytest|python\s+-m\s+pytest|npm\s+(?:test|run\s+(?:test|lint|typecheck|check))|"
     r"pnpm\s+(?:test|lint|typecheck|check)|yarn\s+(?:test|lint|typecheck|check)|"
@@ -312,7 +317,11 @@ def _is_synthetic_user(message: Mapping[str, Any]) -> bool:
         return True
     content = message.get("content")
     text = content.strip() if isinstance(content, str) else ""
-    return text.startswith(_AUTO_CONTINUE_PREFIX) or text == _EMPTY_RECOVERY_TEXT
+    return (
+        text.startswith(_AUTO_CONTINUE_PREFIX)
+        or text == _EMPTY_RECOVERY_TEXT
+        or is_internal_control_text(text)
+    )
 
 
 def _is_contextual_followup(text: str) -> bool:
@@ -328,17 +337,17 @@ def _is_contextual_followup(text: str) -> bool:
 
 
 def _effective_user_goal(messages: Sequence[Mapping[str, Any]]) -> str:
-    goals = [
-        _content_text(message.get("content"))[:1200]
-        for message in messages
+    indexed = [
+        (index, _content_text(message.get("content"))[:1200])
+        for index, message in enumerate(messages)
         if str(message.get("role") or "") == "user" and not _is_synthetic_user(message)
     ]
-    if not goals:
+    if not indexed:
         return ""
-    latest = goals[-1]
+    latest = indexed[-1][1]
     if not _is_contextual_followup(latest):
         return latest
-    for previous in reversed(goals[:-1]):
+    for _, previous in reversed(indexed[:-1]):
         if not _is_contextual_followup(previous):
             return previous
     return latest

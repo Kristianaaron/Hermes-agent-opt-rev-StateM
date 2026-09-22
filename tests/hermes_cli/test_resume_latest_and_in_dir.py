@@ -277,3 +277,62 @@ def test_in_dir_leaves_unset_terminal_cwd_unset(main_mod, monkeypatch, tmp_path)
     main_mod._apply_in_dir(_args(in_dir=str(target)))
 
     assert "TERMINAL_CWD" not in os.environ
+
+
+def test_in_dir_survives_terminal_config_reload(main_mod, monkeypatch, tmp_path):
+    """A run_agent import reloads dotenv and config after --in selects its cwd."""
+    import os
+
+    from agent.runtime_cwd import resolve_agent_cwd
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    configured = tmp_path / "configured-project"
+    configured.mkdir()
+    target = tmp_path / "selected-project"
+    target.mkdir()
+    (home / "config.yaml").write_text(
+        f"terminal:\n  backend: local\n  cwd: {configured}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    main_mod._apply_in_dir(_args(in_dir=str(target)))
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.path.realpath(os.environ["TERMINAL_CWD"]) == os.path.realpath(target)
+    assert resolve_agent_cwd().resolve() == target.resolve()
+
+
+def test_in_dir_survives_gateway_import_bridge(tmp_path):
+    """One-shot agent construction imports gateway.run after --in was applied."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    configured = tmp_path / "configured-project"
+    configured.mkdir()
+    selected = tmp_path / "selected-project"
+    selected.mkdir()
+    (home / "config.yaml").write_text(
+        f"terminal:\n  backend: local\n  cwd: {configured}\n", encoding="utf-8"
+    )
+    script = (
+        "import os; from argparse import Namespace; "
+        "from hermes_cli.main import _apply_in_dir; "
+        f"_apply_in_dir(Namespace(in_dir={str(selected)!r}, no_restore_cwd=False)); "
+        "import gateway.run; "
+        f"assert os.path.realpath(os.environ['TERMINAL_CWD']) == os.path.realpath({str(selected)!r})"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2], env=env,
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr

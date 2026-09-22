@@ -23,6 +23,9 @@ import threading
 import time
 from typing import Any
 
+from agent.task_intent import is_internal_control_text, is_turn_meta_question
+from agent.task_intent import requested_action_kinds, user_wants_action
+
 logger = logging.getLogger(__name__)
 
 _CTX = None
@@ -83,6 +86,11 @@ _READ_ONLY_TOOLS = {
 _DIRECT_MUTATION_TOOLS = {
     "patch", "write_file", "browser_click", "browser_type", "browser_press",
 }
+_PROCESS_TOOLS = {"terminal", "process", "process_manage", "execute_code", "desktop_preview", "open_preview"}
+_READ_ONLY_TERMINAL = re.compile(
+    r"^\s*(?:pwd|ls|rg|grep|find|cat|head|tail|git\s+(?:status|diff|log)|sed\s+-n)\b",
+    re.I,
+)
 _EXPLICIT_FAILURE_TEXT = re.compile(
     r"^\s*(?:traceback\s*\(|(?:tool\s+)?errors?\s*:|failed\s*:|failure\s*:|"
     r"command\s+(?:failed|timed?\s*out)|\[command\s+timed?\s*out|blocked\s*:|"
@@ -108,7 +116,6 @@ _RESULT_COMPLAINT = re.compile(
     r"doesn'?t\s+(?:change|work|apply)|not\s+reflected|still\s+(?:unchanged|wrong))\b",
     re.I,
 )
-
 _FAST_TOOLS = {
     "terminal",
     "read_terminal",
@@ -125,14 +132,99 @@ _FAST_TOOLS = {
     "close_preview",
     "close_terminal",
     "browser_exec",
+    "browser_click",
+    "browser_type",
+    "browser_press",
     "web_search",
     "web_extract",
 }
 
 
-def _semantic_mutation_intent(evidence: dict[str, Any] | None) -> bool:
-    """Use the semantic extractor's intent signal; never infer mutation from a verb list."""
-    return isinstance(evidence, dict) and evidence.get("mutation_intent") is True
+def _user_wants_action(text: str) -> bool:
+    return user_wants_action(text)
+
+
+def _explicit_edit_request(text: str) -> bool:
+    """Any user-requested action, not one example of an edit."""
+    return _user_wants_action(text)
+
+
+def _is_turn_meta(text: str) -> bool:
+    return is_turn_meta_question(text)
+
+
+def _quoted_previous_reply(text: str, previous: str) -> bool:
+    user = " ".join((text or "").split())
+    prior = " ".join((previous or "").split())
+    if len(user) < 40 or len(prior) < 40:
+        return False
+    window = 40
+    for start in range(0, max(1, len(prior) - window + 1), 20):
+        if prior[start:start + window] in user:
+            return True
+    return False
+
+
+def _previous_assistant_prose(messages: list[Any]) -> str:
+    latest_user = None
+    for index in range(len(messages or []) - 1, -1, -1):
+        message = messages[index]
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and not _is_synthetic_user(message)
+        ):
+            latest_user = index
+            break
+    if latest_user is None:
+        return ""
+    for index in range(latest_user - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if message.get("tool_calls"):
+            continue
+        content = message.get("content")
+        text = content.strip() if isinstance(content, str) else ""
+        if text and text != "(empty)":
+            return text
+    return ""
+
+
+def _references_previous_turn(text: str, messages: list[Any] | None = None) -> bool:
+    """True when the latest prose points at the previous turn instead of a new task."""
+    if _is_turn_meta(text):
+        return True
+    return bool(_prior_reply_question_text(text, messages or []))
+
+
+def _prior_reply_question_text(text: str, messages: list[Any]) -> str:
+    """Extract the user's question before a pasted assistant reply.
+
+    A quotation may itself contain imperatives. They are evidence, not a new
+    instruction. An explicit action after the quotation still takes priority.
+    """
+    previous = _previous_assistant_prose(messages or [])
+    if not _quoted_previous_reply(text, previous):
+        return ""
+    user = " ".join((text or "").split())
+    prior = " ".join(previous.split())
+    start = user.find(prior)
+    if start >= 0:
+        before, after = user[:start].strip(), user[start + len(prior):].strip()
+        if _user_wants_action(after):
+            return ""
+    else:
+        start = user.find(prior[:40])
+        before = user[:start].strip() if start >= 0 else ""
+    if _is_turn_meta(before) or not before:
+        return before or "Please explain the previous reply"
+    return ""
+
+
+def _semantic_mutation_intent(evidence: dict[str, Any] | None, user: str = "") -> bool:
+    """Only explicit user action can trigger a mandatory tool call."""
+    return _user_wants_action(user)
 
 _FAST_SYSTEM_PROMPT = """\
 You are Hermes in System 1: act quickly on the user's current bounded request.
@@ -141,7 +233,8 @@ You are Hermes in System 1: act quickly on the user's current bounded request.
 - Do not announce a plan, inspect skills, or search for more tools in the System-1 lane.
 - Use the provided tools directly and follow each schema exactly.
 - For a local dev server, use the terminal background option; never shell '&' or nohup.
-- For a small edit, inspect only the named/obvious file, patch it, and verify proportionally.
+- For a small change, inspect only the named or obvious target, do the action, and verify proportionally.
+- Answer questions about the previous turn from its record. Resume work only when the user asks to continue or finish it. Never replay a completed side effect to answer a question.
 - Batch independent reads. Do not repeat an unchanged failed action.
 - If a tool fails, the request becomes risky/ambiguous, or scope expands, stop guessing; the
   next model call will automatically receive the full Hermes harness.
@@ -150,16 +243,23 @@ Never expose hidden reasoning or private credentials.
 """
 
 _MUTATION_GATE_PROMPT = """\
-You have enough inspection evidence for this bounded edit. Do not read or search again.
-Make the smallest concrete change now with patch/write_file (or the relevant direct UI action),
-then return a concise result. If the evidence is genuinely insufficient, state the exact blocker
-instead of exploring further.
+You have enough evidence for this request. Do not inspect again.
+Perform the user's requested action now with the tools still available, then return a
+concise result. Do not create a file the user did not ask for. If the evidence is
+genuinely insufficient, state the exact blocker instead of exploring further.
 """
 
 _VERIFY_AFTER_MUTATION_PROMPT = """\
-A concrete mutation already landed. Perform at most one proportional verification action now,
-then return the concise result. Do not resume discovery, search outside the workspace, create a
-second implementation, or revisit project selection.
+An action was attempted. Check its result and which parts of the user's request are complete.
+If work remains, continue with the available tools. Verify completed work proportionally,
+then give a concise, accurate result. Do not repeat a completed side effect or revisit
+project selection.
+"""
+
+_BUDGET_EXIT_PROMPT = """\
+This turn has reached its tool-call budget. Report the exact actions completed and their
+verification evidence. State any unfinished work or blocker plainly. Do not claim the
+whole request is complete unless the recorded results prove it.
 """
 
 _FULL_STEERING = """\
@@ -271,8 +371,10 @@ def _strip_attached_context(text: str) -> str:
     return text.strip()
 
 
-def _is_contextual_followup(text: str) -> bool:
-    """Recognize a short discourse-only continuation without task details."""
+def _is_contextual_followup(text: str, messages: list[Any] | None = None) -> bool:
+    """Recognize a continuation that does not replace the current task."""
+    if _references_previous_turn(text, messages):
+        return True
     if not text or len(text) > 160:
         return False
     if (
@@ -321,7 +423,14 @@ def _routing_user_context(messages: list[Any]) -> tuple[str, bool]:
     if not texts:
         return "", False
     latest = texts[-1]
-    if not _is_contextual_followup(latest):
+    # A question about prior work needs the prior exchange as context, but is
+    # not consent to perform that work again. Explicit continue/retry is below.
+    quoted_question = _prior_reply_question_text(latest, messages)
+    if quoted_question:
+        return quoted_question, False
+    if _references_previous_turn(latest, messages):
+        return latest, False
+    if not _is_contextual_followup(latest, messages):
         return latest, False
     # Prefer the most recent concrete action contract over an intervening
     # complaint such as "I'm not seeing the changes".
@@ -352,6 +461,7 @@ def _is_synthetic_user(message: Any) -> bool:
     return (
         text.startswith(_AUTO_CONTINUE_PREFIX)
         or text == _EMPTY_RECOVERY_TEXT
+        or is_internal_control_text(text)
         or any(lowered.startswith(prefix) for prefix in _SYSTEM_CONTINUE_PREFIXES)
     )
 
@@ -369,7 +479,26 @@ def _latest_is_system_continuation(messages: list[Any]) -> bool:
             continue
         content = message.get("content")
         text = content.strip() if isinstance(content, str) else ""
-        return any(text.lower().startswith(prefix) for prefix in _SYSTEM_CONTINUE_PREFIXES)
+        lowered = text.lower()
+        return is_internal_control_text(text) or any(
+            lowered.startswith(prefix) for prefix in _SYSTEM_CONTINUE_PREFIXES
+        )
+    return False
+
+
+def _continuation_needs_tools(messages: list[Any]) -> bool:
+    """True when an internal nudge told the model to act, but tools were closed."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        text = content.strip() if isinstance(content, str) else ""
+        return bool(re.search(
+            r"execute the required tool calls|issue the actual tool call|"
+            r"make the tool call you were planning",
+            text,
+            re.I,
+        ))
     return False
 
 
@@ -544,7 +673,13 @@ def _compact_message(message: Any) -> Any:
         limit = int(_setting("fast_tool_result_chars", 8000))
         content = keep["content"]
         if len(content) > limit:
-            keep["content"] = content[:limit] + "\n[tool output truncated by System-1 lane]"
+            head = max(1, int(limit * 0.6))
+            tail = max(1, limit - head)
+            keep["content"] = (
+                content[:head]
+                + "\n[tool output middle omitted by System-1 lane]\n"
+                + content[-tail:]
+            )
     return keep
 
 
@@ -619,7 +754,7 @@ def _needs_recent_exchange(messages: list[Any], user_idx: int) -> bool:
     else:
         text = str(content or "")
     text = _strip_attached_context(text)
-    return _is_contextual_followup(text) or bool(_RECENT_EXCHANGE_REFERENCE.search(text))
+    return _is_contextual_followup(text, messages) or bool(_RECENT_EXCHANGE_REFERENCE.search(text))
 
 
 def _compact_current_turn(messages: list[Any]) -> list[Any]:
@@ -756,9 +891,23 @@ def _apply_history_compaction(request: dict[str, Any]) -> tuple[dict[str, Any], 
     }
 
 
+def _pending_action_tools(user: str, tools: list[Any]) -> list[Any]:
+    """Stop inspection loops while retaining the tools that can perform work."""
+    kinds = requested_action_kinds(user)
+    if "file" in kinds:
+        allowed = set(_DIRECT_MUTATION_TOOLS) | {"browser_exec"}
+        if "process" in kinds or re.search(r"\b(?:terminal|shell|command line)\b", user or "", re.I):
+            allowed |= _PROCESS_TOOLS
+        kept = [tool for tool in tools if _tool_name(tool) in allowed]
+        if kept:
+            return kept
+    kept = [tool for tool in tools if _tool_name(tool) not in _READ_ONLY_TOOLS]
+    return kept or tools
+
+
 def _apply_fast_lane(
     request: dict[str, Any], *, no_tools: bool = False, full_tools: bool = False,
-    force_mutation: bool = False,
+    force_mutation: bool = False, user: str = "",
 ) -> tuple[dict[str, Any], dict[str, int]]:
     updated = dict(request)
     message_key, messages = _request_messages(updated)
@@ -785,11 +934,7 @@ def _apply_fast_lane(
             required=updated.get("tool_choice") == "required",
         )
         if force_mutation:
-            mutation_tools = [
-                tool for tool in updated["tools"] if _tool_name(tool) in _DIRECT_MUTATION_TOOLS
-            ]
-            if mutation_tools:
-                updated["tools"] = mutation_tools
+            updated["tools"] = _pending_action_tools(user, updated["tools"])
     try:
         fast_max = max(512, int(_setting("fast_max_tokens", 4096)))
     except (TypeError, ValueError):
@@ -808,17 +953,15 @@ def _apply_fast_lane(
 
 def _enforce_edit_action(
     request: dict[str, Any], *, require_action: bool, force_mutation: bool,
+    user: str = "",
 ) -> dict[str, Any]:
-    """Preserve the explicit-edit contract across every reasoning lane."""
+    """Preserve a requested action across every reasoning lane."""
     updated = dict(request)
     tools = updated.get("tools")
     if not isinstance(tools, list) or not tools:
         return updated
     if force_mutation:
-        tools = [
-            tool for tool in tools
-            if _tool_name(tool) in _DIRECT_MUTATION_TOOLS
-        ]
+        tools = _pending_action_tools(user, tools)
         if tools:
             updated["tools"] = tools
     if require_action and updated.get("tools"):
@@ -836,7 +979,9 @@ def _configured_effort(request: dict[str, Any]) -> str:
     return str(ctk.get("reasoning_effort") or "").lower()
 
 
-def _remember_lane(turn_id: str, candidate: str, *, bounded_clamp: bool = False) -> str:
+def _remember_lane(
+    turn_id: str, candidate: str, *, bounded_clamp: bool = False, reopen: bool = False,
+) -> str:
     if not turn_id:
         return candidate
     rank = {
@@ -858,8 +1003,11 @@ def _remember_lane(turn_id: str, candidate: str, *, bounded_clamp: bool = False)
                 _TURN_LANES.pop(key, None)
         previous = _TURN_LANES.get(turn_id, ("fast", now))[0]
         # A bounded policy decision may repair an earlier accidental broad/low
-        # classification. It must never demote full/high or reopen finalization.
-        if bounded_clamp and previous in {"fast", "standard_compact", "verify_compact", "standard"}:
+        # classification. It must never demote full/high. Finalization reopens
+        # only when a stall nudge asked for a tool call that tools-off cannot make.
+        if reopen and previous in {"finalize", "finalize_reasoning"}:
+            lane = candidate
+        elif bounded_clamp and previous in {"fast", "standard_compact", "verify_compact", "standard"}:
             lane = candidate
         else:
             lane = candidate if rank[candidate] >= rank[previous] else previous
@@ -925,7 +1073,12 @@ def _tool_activity_records(messages: list[Any]) -> list[dict[str, Any]]:
                 (function.get("name") if isinstance(function, dict) else None)
                 or call.get("name") or ""
             )
-            record = {"name": name, "result": None}
+            raw_args = (function.get("arguments") if isinstance(function, dict) else None) or call.get("arguments")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except (TypeError, ValueError):
+                args = {}
+            record = {"name": name, "result": None, "args": args if isinstance(args, dict) else {}}
             records.append(record)
             call_id = str(call.get("id") or call.get("call_id") or "")
             if call_id:
@@ -969,6 +1122,34 @@ def _tool_activity(messages: list[Any]) -> tuple[int, int]:
     return reads, mutations
 
 
+def _process_action_attempted(messages: list[Any]) -> bool:
+    """A process task is done even when its command reports a failing test."""
+    for record in _tool_activity_records(messages):
+        if record["name"] not in _PROCESS_TOOLS or record["result"] is None:
+            continue
+        args = record["args"]
+        if record["name"] == "terminal":
+            command = str(args.get("command") or "")
+            if command and not re.search(r"[;&|\n]", command) and _READ_ONLY_TERMINAL.match(command):
+                continue
+        if record["name"] in {"process", "process_manage"}:
+            if str(args.get("action") or "").lower() in {"list", "status", "logs", "read", "poll"}:
+                continue
+        return True
+    return False
+
+
+def _requested_action_outstanding(messages: list[Any], user: str) -> bool:
+    kinds = requested_action_kinds(user)
+    if not kinds:
+        return False
+    _, mutations = _tool_activity(messages)
+    return (
+        ("file" in kinds and mutations == 0)
+        or ("process" in kinds and not _process_action_attempted(messages))
+    )
+
+
 def _reads_after_last_mutation(messages: list[Any]) -> tuple[int, int]:
     """Return landed mutations and successful subsequent verification reads."""
     records = _tool_activity_records(messages)
@@ -991,14 +1172,14 @@ def _reads_after_last_mutation(messages: list[Any]) -> tuple[int, int]:
 def _mutation_gate_needed(
     messages: list[Any], user: str, evidence: dict[str, Any] | None = None,
 ) -> bool:
-    if not _semantic_mutation_intent(evidence):
+    if not _semantic_mutation_intent(evidence, user):
         return False
-    reads, mutations = _tool_activity(messages)
+    reads, _ = _tool_activity(messages)
     try:
         threshold = max(1, int(_setting("max_reads_before_edit", 3)))
     except (TypeError, ValueError):
         threshold = 3
-    return mutations == 0 and reads >= threshold
+    return _requested_action_outstanding(messages, user) and reads >= threshold
 
 
 def _mutation_action_required(
@@ -1011,12 +1192,11 @@ def _mutation_action_required(
     that false-success path structurally unavailable.
     """
     if not (
-        _semantic_mutation_intent(evidence)
-        and _BOUNDED_ACTION.search(user or "")
+        _semantic_mutation_intent(evidence, user)
+        and (_explicit_edit_request(user) or _BOUNDED_ACTION.search(user or ""))
     ):
         return False
-    _, mutations = _tool_activity(messages)
-    return mutations == 0
+    return _requested_action_outstanding(messages, user)
 
 
 def _decide_lane(
@@ -1030,8 +1210,27 @@ def _decide_lane(
     configured = _configured_effort(request)
     remembered = _remembered_lane(turn_id)
 
+    if _references_previous_turn(_latest_user_text(messages), messages):
+        if _latest_is_empty_recovery(messages):
+            return _remember_lane(turn_id, "finalize_reasoning"), (
+                "question answer was empty; retry with reasoning and no tools"
+            )
+        return _remember_lane(turn_id, "fast", bounded_clamp=True), (
+            "question about previous turn; answer from context"
+        )
     if configured == "high":
         return _remember_lane(turn_id, "full"), "picker requested high"
+    try:
+        post_action_cap = max(12, int(_setting("post_action_max_calls", 24)))
+    except (TypeError, ValueError):
+        post_action_cap = 24
+    if (
+        (_tool_activity(messages)[1] or _process_action_attempted(messages))
+        and _effective_fast_calls(messages, api_call_count) > post_action_cap
+    ):
+        return _remember_lane(turn_id, "finalize_reasoning"), (
+            "post-action tool budget reached; report exact completion state"
+        )
     if _latest_is_empty_recovery(messages):
         if remembered in {"finalize", "finalize_reasoning"}:
             return _remember_lane(turn_id, "finalize_reasoning"), (
@@ -1041,6 +1240,12 @@ def _decide_lane(
             "empty-after-tool recovery; enable compact reasoning"
         )
     if remembered and _latest_is_system_continuation(messages):
+        if remembered in {"finalize", "finalize_reasoning"} and _continuation_needs_tools(messages):
+            # Finalization had closed the tools, then the stall guard asked for
+            # the action. Keeping tools closed is what ends the turn as reasoning.
+            return _remember_lane(
+                turn_id, "standard_compact", bounded_clamp=True, reopen=True,
+            ), "tools-off finalize stalled; restore tools to finish the action"
         return _remember_lane(turn_id, remembered), "synthetic continuation; preserve active lane"
     if _mutation_failure_recovery(messages):
         return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
@@ -1048,12 +1253,12 @@ def _decide_lane(
         )
     mutations, post_mutation_reads = _reads_after_last_mutation(messages)
     if mutations and post_mutation_reads >= 1:
-        return _remember_lane(turn_id, "finalize_reasoning"), (
-            "mutation landed and verification attempted; finalize"
+        return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
+            "action verified; assess remaining work"
         )
     if mutations:
         return _remember_lane(turn_id, "verify_compact", bounded_clamp=True), (
-            "mutation landed; allow one proportional verification"
+            "action landed; verify and assess remaining work"
         )
     if len(user) > int(_setting("full_request_chars", 1800)) or _HARD_COMPLEX_GUARD.search(user):
         return _remember_lane(turn_id, "full"), "complex guard"
@@ -1069,6 +1274,13 @@ def _decide_lane(
             "two distinct bounded tool failures; compact reasoning recovery"
         )
     if failures >= 2 or repeated >= 2:
+        _reads, _mutations = _tool_activity(messages)
+        if _user_wants_action(user) and _reads >= 2 and _mutations == 0 and not _tool_result_failed(messages):
+            # Repeated searches on a small edit are a stall, not an architecture
+            # problem. Stay on compact low reasoning and force the patch.
+            return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
+                "explicit edit stalled in inspection; patch next"
+            )
         return _remember_lane(turn_id, "full"), f"failure={failures} repeated={repeated}"
     if isinstance(evidence, dict) and str(evidence.get("decision") or "") == "full":
         category = str(evidence.get("category") or "unknown")
@@ -1115,6 +1327,10 @@ def _decide_lane(
         return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
             "first tool failure; compact recovery"
         )
+    if "process" in requested_action_kinds(user) and _process_action_attempted(messages):
+        return _remember_lane(turn_id, "standard_compact", bounded_clamp=True), (
+            "process action attempted; report result or continue remaining work"
+        )
     if user and len(user) <= bounded_chars and _BOUNDED_ACTION.search(user):
         weak = ""
         if isinstance(evidence, dict) and evidence.get("decision") == "full":
@@ -1155,7 +1371,7 @@ def on_llm_request(**kwargs: Any):
 
     stats: dict[str, int] = {}
     user = _routing_user_text(messages)
-    force_mutation = _mutation_gate_needed(messages, user, evidence) or _mutation_failure_recovery(messages)
+    force_mutation = _mutation_gate_needed(messages, user, evidence)
     require_mutation_action = _mutation_action_required(messages, user, evidence)
     if lane == "fast":
         updated = _apply_effort(request, "low", thinking=False)
@@ -1163,16 +1379,19 @@ def on_llm_request(**kwargs: Any):
             updated["tool_choice"] = "required"
         # GLiNER evidence is advisory. A stale/incorrect quick-response label
         # must never remove tools from an explicit action or edit request.
-        prose_only = (
+        latest_user = _latest_user_text(messages)
+        prose_only = _references_previous_turn(latest_user, messages) or (
             isinstance(evidence, dict)
             and evidence.get("category") == "quick_response"
             and not _BOUNDED_ACTION.search(user or "")
-            and not _semantic_mutation_intent(evidence)
+            and not _semantic_mutation_intent(evidence, user)
+            and not _is_contextual_followup(latest_user, messages)
         )
         updated, stats = _apply_fast_lane(
             updated,
             no_tools=prose_only,
             force_mutation=force_mutation,
+            user=user,
         )
         effort = "off"
     elif lane == "standard_compact":
@@ -1180,7 +1399,14 @@ def on_llm_request(**kwargs: Any):
         if require_mutation_action and isinstance(updated.get("tools"), list) and updated["tools"]:
             updated["tool_choice"] = "required"
         # Recovery gets a little reasoning, not the whole tool universe/history.
-        updated, stats = _apply_fast_lane(updated, force_mutation=force_mutation)
+        updated, stats = _apply_fast_lane(updated, force_mutation=force_mutation, user=user)
+        if _tool_activity(messages)[1] or _process_action_attempted(messages):
+            message_key, compact_messages = _request_messages(updated)
+            if message_key and compact_messages and isinstance(compact_messages[0], dict):
+                system = dict(compact_messages[0])
+                system["content"] = str(system.get("content") or "") + "\n" + _VERIFY_AFTER_MUTATION_PROMPT
+                compact_messages[0] = system
+                updated[message_key] = compact_messages
         effort = "low"
     elif lane == "verify_compact":
         updated = _apply_effort(request, "low", thinking=True)
@@ -1209,8 +1435,17 @@ def on_llm_request(**kwargs: Any):
         updated, stats = _apply_history_compaction(updated)
         effort = "low"
 
+    if lane in {"finalize", "finalize_reasoning"}:
+        message_key, compact_messages = _request_messages(updated)
+        if message_key and compact_messages and isinstance(compact_messages[0], dict):
+            system = dict(compact_messages[0])
+            system["content"] = str(system.get("content") or "") + "\n" + _BUDGET_EXIT_PROMPT
+            compact_messages[0] = system
+            updated[message_key] = compact_messages
+
     updated = _enforce_edit_action(
         updated, require_action=require_mutation_action, force_mutation=force_mutation,
+        user=user,
     )
 
     logger.info(

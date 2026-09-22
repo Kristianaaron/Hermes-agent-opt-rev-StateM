@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextvars import ContextVar
 from typing import Any
 
+from agent.task_intent import is_internal_control_text
+
 logger = logging.getLogger(__name__)
 
 _MODEL = None
@@ -232,7 +234,11 @@ def _is_synthetic_user(message: Any) -> bool:
         return True
     content = message.get("content")
     text = content.strip() if isinstance(content, str) else ""
-    return text.startswith(_AUTO_CONTINUE_PREFIX) or text == _EMPTY_RECOVERY_TEXT
+    return (
+        text.startswith(_AUTO_CONTINUE_PREFIX)
+        or text == _EMPTY_RECOVERY_TEXT
+        or is_internal_control_text(text)
+    )
 
 
 def _should_probe(text: str) -> bool:

@@ -435,8 +435,9 @@ _DECISION_MESSAGES: dict[str, str] = {
         "Return the result or a concise blocker instead of continuing an open-ended loop."
     ),
     "read_only_streak_halt": (
-        "Stopped {tool_name}: {count} consecutive inspection/read-only actions produced no mutation "
-        "or completion. Use the evidence already collected and answer, or make one concrete change."
+        "Stopped {tool_name}: {count} consecutive inspection/read-only actions produced no edit. "
+        "Use the evidence already collected and apply the change now with patch or write_file. "
+        "Do not search or read again, and do not write a session note."
     ),
     "unproductive_streak_halt": (
         "Stopped {tool_name}: {count} consecutive actions failed or only inspected state without "
@@ -520,6 +521,7 @@ class ToolCallGuardrailController:
         self._commentary_gate_empty_count = 0
         self._recovery_block_counts: dict[ToolCallSignature, int] = {}
         self._stale_anchor_counts: dict[ToolCallSignature, int] = {}
+        self._read_only_edit_released = False
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -539,6 +541,18 @@ class ToolCallGuardrailController:
         if self._user_goal_kind == "status":
             return self.config.status_ask_max_tool_only
         return self.config.max_tool_only_iterations
+
+    def release_read_only_halt(self) -> bool:
+        """Give one extra model turn after a read-only stop so an edit can still land.
+
+        The first release clears the halt. A later read-only stop in the same turn
+        stays halted.
+        """
+        if self._read_only_edit_released:
+            return False
+        self._read_only_edit_released = True
+        self._halt_decision = None
+        return True
 
     def observe_user_goal(self, text: str) -> None:
         """Classify the user turn and arm the ping brake before the first tool."""

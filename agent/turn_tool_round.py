@@ -19,6 +19,31 @@ from agent.turn_tool_validation import validate_tool_calls
 
 logger = logging.getLogger("agent.conversation_loop")
 
+
+def _release_read_only_edit(agent: Any, decision: Any, user_message: Any) -> bool:
+    """Keep a requested action alive for one more turn after an inspection stop.
+
+    A read-only review still halts. Any request to change, run, or otherwise
+    act gets one chance to do that action from the evidence already collected.
+    """
+    if getattr(decision, "code", "") != "read_only_streak_halt":
+        return False
+    text = user_message if isinstance(user_message, str) else ""
+    if not text and isinstance(user_message, list):
+        text = "\n".join(
+            str(block.get("text") or "")
+            for block in user_message
+            if isinstance(block, dict)
+        )
+    try:
+        from agent.frontier_harness import looks_like_edit_request
+    except Exception:
+        return False
+    if not looks_like_edit_request(text):
+        return False
+    release = getattr(getattr(agent, "_tool_guardrails", None), "release_read_only_halt", None)
+    return bool(callable(release) and release())
+
 # Post-response housekeeping tools: a round made only of these mutes tool progress.
 _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session_search"})
 
@@ -158,6 +183,11 @@ def run_tool_round(
         final_response = ""
         failed = True
         return _verdict("break")
+
+    if agent._tool_guardrail_halt_decision is not None and _release_read_only_edit(
+        agent, agent._tool_guardrail_halt_decision, user_message,
+    ):
+        agent._tool_guardrail_halt_decision = None
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision

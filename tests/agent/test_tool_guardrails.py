@@ -890,6 +890,24 @@ def test_a_real_tool_error_is_still_a_failure():
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
 
 
+def test_read_only_halt_can_be_released_once_for_an_edit():
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig(
+        hard_stop_enabled=True,
+        max_consecutive_read_only=2,
+    ))
+    for index in range(2):
+        args = {"path": f"/tmp/{index}"}
+        assert controller.before_call("read_file", args).allows_execution
+        controller.after_call("read_file", args, "contents", failed=False)
+    halted = controller.before_call("read_file", {"path": "/tmp/again"})
+    assert halted.should_halt
+    assert controller.release_read_only_halt() is True
+    assert controller.halt_decision is None
+    assert controller.release_read_only_halt() is False
+    halted_again = controller.before_call("read_file", {"path": "/tmp/third"})
+    assert halted_again.should_halt
+
+
 def test_read_only_streak_stops_varied_browser_inspection_loop():
     controller = ToolCallGuardrailController(ToolCallGuardrailConfig(
         hard_stop_enabled=True,

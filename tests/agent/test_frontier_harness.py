@@ -214,3 +214,33 @@ def test_frontier_protocol_includes_codex_turn_and_stale_anchor_rules():
     assert "Codex turn rule" in _PROTOCOL
     assert "old_text/old_string" in _PROTOCOL
     assert "user-visible assistant message" in _PROTOCOL
+    assert "asks for an explanation" in _PROTOCOL
+    assert "file the user did not ask for" in _PROTOCOL
+
+
+def test_harness_control_row_does_not_replace_the_goal():
+    messages = [
+        {"role": "user", "content": "Decrease the step header weights from 700 to 500"},
+        {"role": "assistant", "content": "patched one heading"},
+        {
+            "role": "user",
+            "content": (
+                "[System: You edited code in this turn, but the workspace does not "
+                "have fresh passing verification evidence yet. Create a tempfile "
+                "named hermes-verify- and run it."
+            ),
+        },
+    ]
+    state = _analyze(messages, {"path_deviation_failure_streak": 2, "max_unproductive_actions": 4})
+    assert state["goal"] == "Decrease the step header weights from 700 to 500"
+
+
+def test_quoting_previous_reply_is_a_question_not_a_repeated_goal():
+    reply = "I opened the workspace, listed the components, and stopped before editing anything."
+    messages = [
+        {"role": "user", "content": "Rename the export button to Save"},
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": "what did you do?\n\n" + reply},
+    ]
+    state = _analyze(messages, {"path_deviation_failure_streak": 2, "max_unproductive_actions": 4})
+    assert state["goal"].startswith("what did you do?")

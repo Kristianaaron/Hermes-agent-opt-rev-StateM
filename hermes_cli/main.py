@@ -1527,6 +1527,9 @@ def _apply_in_dir(args) -> None:
     """--in DIR: chdir first so workspace-scoped lookups key off DIR; pins the session there."""
     in_dir = getattr(args, "in_dir", None)
     if not in_dir:
+        from agent.runtime_cwd import pin_explicit_cli_cwd
+
+        pin_explicit_cli_cwd(None)
         return
     # Git Bash / MSYS hands us POSIX-style paths (`--in ~` → `/c/Users/x`);
     # translate drive-root spellings to native Windows form. No-op elsewhere.
@@ -1541,6 +1544,9 @@ def _apply_in_dir(args) -> None:
     except OSError as e:
         print(f"Error: cannot enter --in directory {in_dir}: {e}")
         sys.exit(1)
+    from agent.runtime_cwd import pin_explicit_cli_cwd
+
+    pin_explicit_cli_cwd(_target_dir)
     # Every cwd consumer (resolve_agent_cwd -> Codex app-server thread cwd, the
     # terminal tool, context-file discovery) prefers TERMINAL_CWD over the process
     # cwd, so a value inherited from a parent surface, the shell or .env outlives

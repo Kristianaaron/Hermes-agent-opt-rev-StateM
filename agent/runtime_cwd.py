@@ -18,11 +18,26 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
+_CLI_PINNED_CWD: tuple[int, str] | None = None
 
 # The package/source root (<root>/agent/runtime_cwd.py). A backend launched from or
 # self-spawned into this tree (desktop default) must never let an os.getcwd() fallback
 # inject this repo's contributor AGENTS.md as project context.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def pin_explicit_cli_cwd(cwd: str | None) -> None:
+    """Remember --in for later config reloads in this CLI process only."""
+    global _CLI_PINNED_CWD
+    _CLI_PINNED_CWD = (os.getpid(), os.path.realpath(cwd)) if cwd else None
+
+
+def explicit_cli_cwd() -> str:
+    """Return the active --in directory; never inherit it into child processes."""
+    pinned = _CLI_PINNED_CWD
+    if not pinned or pinned[0] != os.getpid():
+        return ""
+    return pinned[1] if os.path.realpath(os.getcwd()) == pinned[1] else ""
 
 
 def _is_install_tree(p: Path) -> bool:
